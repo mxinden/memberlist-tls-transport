@@ -3,20 +3,63 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/memberlist"
 	"github.com/mxinden/tls_memberlist/internal"
 )
 
 func main() {
+	list1, err := createMemberlist(9000)
+	if err != nil {
+		panic("failed to create memberlist")
+	}
+
+	list2, err := createMemberlist(9001)
+	if err != nil {
+		panic("failed to create memberlist")
+	}
+
+	n, err := list1.Join([]string{"127.0.0.1:9001"})
+	if err != nil {
+		panic("failed to join cluster")
+	}
+
+	fmt.Printf("joined %v clusters", n)
+	n, err = list2.Join([]string{"127.0.0.1:9000"})
+	if err != nil {
+		panic("failed to join cluster")
+	}
+	fmt.Printf("joined %v clusters", n)
+
+	time.Sleep(time.Second * 30)
+
+	for _, m := range list1.Members() {
+		fmt.Printf("Member: %s %s\n", m.Name, m.Addr)
+	}
+
+	for _, m := range list2.Members() {
+		fmt.Printf("Member: %s %s\n", m.Name, m.Addr)
+	}
+}
+
+func createMemberlist(port int) (*memberlist.Memberlist, error) {
 	conf := memberlist.DefaultLocalConfig()
 
+	conf.Name = fmt.Sprintf("cluster-%v", port)
+
+	conf.BindPort = port
+	conf.BindAddr = "127.0.0.1"
+	conf.Logger = log.New(os.Stderr, "", log.LstdFlags)
+
+	// TODO: Should be tls transport config.
 	nc := &internal.NetTransportConfig{
 		BindAddrs: []string{conf.BindAddr},
 		BindPort:  conf.BindPort,
 		// TODO: insert proper logger.
-		Logger: &log.Logger{},
+		Logger: conf.Logger,
 	}
 
 	// See comment below for details about the retry in here.
@@ -59,12 +102,5 @@ func main() {
 	}
 	conf.Transport = nt
 
-	list, err := memberlist.Create(conf)
-	if err != nil {
-		panic("failed to create memberlist")
-	}
-
-	for _, m := range list.Members() {
-		fmt.Printf("Member: %s %s\n", m.Name, m.Addr)
-	}
+	return memberlist.Create(conf)
 }

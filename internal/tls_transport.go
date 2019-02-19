@@ -1,14 +1,17 @@
 package internal
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/armon/go-metrics"
+	// "github.com/armon/go-metrics"
 	sockaddr "github.com/hashicorp/go-sockaddr"
 	"github.com/hashicorp/memberlist"
 )
@@ -44,8 +47,8 @@ type NetTransport struct {
 	streamCh     chan net.Conn
 	logger       *log.Logger
 	wg           sync.WaitGroup
-	tcpListeners []*net.TCPListener
-	udpListeners []*net.UDPConn
+	tcpListeners []net.Listener
+	udpListeners []net.Listener
 	shutdown     int32
 }
 
@@ -79,10 +82,18 @@ func NewNetTransport(config *NetTransportConfig) (*NetTransport, error) {
 	for _, addr := range config.BindAddrs {
 		ip := net.ParseIP(addr)
 
-		tcpAddr := &net.TCPAddr{IP: ip, Port: port}
-		tcpLn, err := net.ListenTCP("tcp", tcpAddr)
+		cer, err := tls.LoadX509KeyPair("/tmp/server.crt", "/tmp/server.key")
 		if err != nil {
-			return nil, fmt.Errorf("Failed to start TCP listener on %q port %d: %v", addr, port, err)
+			return nil, fmt.Errorf("%v", err)
+		}
+
+		tcpAddr := &net.TCPAddr{IP: ip, Port: port}
+		config.Logger.Printf("tcp address: %v", tcpAddr.String())
+		tcpLn, err := tls.Listen("tcp", tcpAddr.String(), &tls.Config{
+			Certificates: []tls.Certificate{cer},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("Failed to start TLS listener on %q port %d: %v", addr, port, err)
 		}
 		t.tcpListeners = append(t.tcpListeners, tcpLn)
 
@@ -93,14 +104,20 @@ func NewNetTransport(config *NetTransportConfig) (*NetTransport, error) {
 			port = tcpLn.Addr().(*net.TCPAddr).Port
 		}
 
-		udpAddr := &net.UDPAddr{IP: ip, Port: port}
-		udpLn, err := net.ListenUDP("udp", udpAddr)
+		// TODO: Fix var names.
+		// TODO: Don't just increase port by 3.
+		udpAddr := &net.TCPAddr{IP: ip, Port: port + 3}
+		config.Logger.Printf("pseudo tcp address: %v", udpAddr.String())
+		udpLn, err := tls.Listen("tcp", udpAddr.String(), &tls.Config{
+			Certificates: []tls.Certificate{cer},
+		})
 		if err != nil {
-			return nil, fmt.Errorf("Failed to start UDP listener on %q port %d: %v", addr, port, err)
+			return nil, fmt.Errorf("Failed to start TLS packed oriented listener on %q port %d: %v", addr, port, err)
 		}
-		if err := setUDPRecvBuf(udpLn); err != nil {
-			return nil, fmt.Errorf("Failed to resize UDP buffer: %v", err)
-		}
+		// TODO: Is this still needed?
+		// if err := setUDPRecvBuf(udpLn); err != nil {
+		// 	return nil, fmt.Errorf("Failed to resize UDP buffer: %v", err)
+		// }
 		t.udpListeners = append(t.udpListeners, udpLn)
 	}
 
@@ -171,17 +188,28 @@ func (t *NetTransport) FinalAdvertiseAddr(ip string, port int) (net.IP, int, err
 
 // See Transport.
 func (t *NetTransport) WriteTo(b []byte, addr string) (time.Time, error) {
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	fmt.Println("Write to address: ", addr)
+	roots := x509.NewCertPool()
+
+	conn, err := tls.Dial("tcp", addr, &tls.Config{
+		RootCAs: roots,
+		// TODO: Remove InsecureSkipVerify.
+		InsecureSkipVerify: true,
+	})
 	if err != nil {
+		t.logger.Println(err)
 		return time.Time{}, err
 	}
 
-	// We made sure there's at least one UDP listener, so just use the
-	// packet sending interface on the first one. Take the time after the
-	// write call comes back, which will underestimate the time a little,
-	// but help account for any delays before the write occurs.
-	_, err = t.udpListeners[0].WriteTo(b, udpAddr)
-	return time.Now(), err
+	defer conn.Close()
+
+	_, err = conn.Write(b)
+	if err != nil {
+		t.logger.Println(err)
+		return time.Time{}, err
+	}
+
+	return time.Now(), nil
 }
 
 // See Transport.
@@ -191,8 +219,16 @@ func (t *NetTransport) PacketCh() <-chan *memberlist.Packet {
 
 // See Transport.
 func (t *NetTransport) DialTimeout(addr string, timeout time.Duration) (net.Conn, error) {
-	dialer := net.Dialer{Timeout: timeout}
-	return dialer.Dial("tcp", addr)
+	roots := x509.NewCertPool()
+
+	// TODO: What about dialer timeout like:
+	// dialer := net.Dialer{Timeout: timeout}
+
+	return tls.Dial("tcp", addr, &tls.Config{
+		RootCAs: roots,
+		// TODO: Remove InsecureSkipVerify.
+		InsecureSkipVerify: true,
+	})
 }
 
 // See Transport.
@@ -220,10 +256,10 @@ func (t *NetTransport) Shutdown() error {
 
 // tcpListen is a long running goroutine that accepts incoming TCP connections
 // and hands them off to the stream channel.
-func (t *NetTransport) tcpListen(tcpLn *net.TCPListener) {
+func (t *NetTransport) tcpListen(ln net.Listener) {
 	defer t.wg.Done()
 	for {
-		conn, err := tcpLn.AcceptTCP()
+		conn, err := ln.Accept()
 		if err != nil {
 			if s := atomic.LoadInt32(&t.shutdown); s == 1 {
 				break
@@ -239,38 +275,33 @@ func (t *NetTransport) tcpListen(tcpLn *net.TCPListener) {
 
 // udpListen is a long running goroutine that accepts incoming UDP packets and
 // hands them off to the packet channel.
-func (t *NetTransport) udpListen(udpLn *net.UDPConn) {
+func (t *NetTransport) udpListen(udpLn net.Listener) {
 	defer t.wg.Done()
+
 	for {
-		// Do a blocking read into a fresh buffer. Grab a time stamp as
-		// close as possible to the I/O.
-		buf := make([]byte, udpPacketBufSize)
-		n, addr, err := udpLn.ReadFrom(buf)
 		ts := time.Now()
+
+		conn, err := udpLn.Accept()
 		if err != nil {
-			if s := atomic.LoadInt32(&t.shutdown); s == 1 {
-				break
+			t.logger.Fatal(err)
+		}
+
+		go func(conn net.Conn, startTime time.Time) {
+			defer conn.Close()
+
+			msg, err := ioutil.ReadAll(conn)
+			if err != nil {
+				t.logger.Fatal(err)
 			}
 
-			t.logger.Printf("[ERR] memberlist: Error reading UDP packet: %v", err)
-			continue
-		}
-
-		// Check the length - it needs to have at least one byte to be a
-		// proper message.
-		if n < 1 {
-			t.logger.Printf("[ERR] memberlist: UDP packet too short (%d bytes) %s",
-				len(buf), memberlist.LogAddress(addr))
-			continue
-		}
-
-		// Ingest the packet.
-		metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
-		t.packetCh <- &memberlist.Packet{
-			Buf:       buf[:n],
-			From:      addr,
-			Timestamp: ts,
-		}
+			// TODO: Should we still increase these metrics?
+			// metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
+			t.packetCh <- &memberlist.Packet{
+				Buf:       msg,
+				From:      conn.RemoteAddr(),
+				Timestamp: startTime,
+			}
+		}(conn, ts)
 	}
 }
 
