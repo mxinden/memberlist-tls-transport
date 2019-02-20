@@ -47,6 +47,7 @@ func main() {
 
 func createMemberlist(port int) (*memberlist.Memberlist, error) {
 	conf := memberlist.DefaultLocalConfig()
+	conf.UDPBufferSize = 1
 
 	conf.Name = fmt.Sprintf("cluster-%v", port)
 

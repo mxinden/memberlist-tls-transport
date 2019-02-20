@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -82,7 +83,7 @@ func NewNetTransport(config *NetTransportConfig) (*NetTransport, error) {
 	for _, addr := range config.BindAddrs {
 		ip := net.ParseIP(addr)
 
-		cer, err := tls.LoadX509KeyPair("/tmp/server.crt", "/tmp/server.key")
+		cer, err := tls.LoadX509KeyPair("server.crt", "server.key")
 		if err != nil {
 			return nil, fmt.Errorf("%v", err)
 		}
@@ -189,6 +190,7 @@ func (t *NetTransport) FinalAdvertiseAddr(ip string, port int) (net.IP, int, err
 // See Transport.
 func (t *NetTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 	fmt.Println("Write to address: ", addr)
+
 	roots := x509.NewCertPool()
 
 	conn, err := tls.Dial("tcp", addr, &tls.Config{
@@ -203,11 +205,18 @@ func (t *NetTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 
 	defer conn.Close()
 
+	// Signal that this is a packet connection.
+	conn.Write([]byte{'p'})
+
+	conn.Write([]byte(strconv.Itoa(t.config.BindPort)))
+
 	_, err = conn.Write(b)
 	if err != nil {
 		t.logger.Println(err)
 		return time.Time{}, err
 	}
+
+	t.logger.Printf("Wrote: %q", b)
 
 	return time.Now(), nil
 }
@@ -224,11 +233,22 @@ func (t *NetTransport) DialTimeout(addr string, timeout time.Duration) (net.Conn
 	// TODO: What about dialer timeout like:
 	// dialer := net.Dialer{Timeout: timeout}
 
-	return tls.Dial("tcp", addr, &tls.Config{
+	conn, err := tls.Dial("tcp", addr, &tls.Config{
 		RootCAs: roots,
 		// TODO: Remove InsecureSkipVerify.
 		InsecureSkipVerify: true,
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Signal that this is a stream connection.
+	_, err = conn.Write([]byte{'s'})
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, nil
 }
 
 // See Transport.
@@ -259,6 +279,7 @@ func (t *NetTransport) Shutdown() error {
 func (t *NetTransport) tcpListen(ln net.Listener) {
 	defer t.wg.Done()
 	for {
+		ts := time.Now()
 		conn, err := ln.Accept()
 		if err != nil {
 			if s := atomic.LoadInt32(&t.shutdown); s == 1 {
@@ -269,7 +290,51 @@ func (t *NetTransport) tcpListen(ln net.Listener) {
 			continue
 		}
 
-		t.streamCh <- conn
+		b := make([]byte, 1)
+
+		if _, err := conn.Read(b); err != nil {
+			t.logger.Fatal(err)
+		}
+
+		if b[0] == 'p' {
+			defer conn.Close()
+
+			remotePort := make([]byte, 4)
+			if _, err := conn.Read(remotePort); err != nil {
+				t.logger.Fatal(err)
+			}
+
+			t.logger.Printf("#### got the following port: %v", string(remotePort))
+
+			parsedPort, err := strconv.Atoi(string(remotePort))
+			if err != nil {
+				t.logger.Fatal(err)
+			}
+
+			msg, err := ioutil.ReadAll(conn)
+			if err != nil {
+				t.logger.Fatal(err)
+			}
+
+			t.logger.Printf("Read: %q", msg)
+
+			addr := &net.TCPAddr{
+				IP:   []byte{127, 0, 0, 1},
+				Port: parsedPort,
+			}
+
+			t.logger.Printf("### Address: %v", addr)
+
+			// TODO: Should we still increase these metrics?
+			// metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
+			t.packetCh <- &memberlist.Packet{
+				Buf:       msg,
+				From:      addr,
+				Timestamp: ts,
+			}
+		} else {
+			t.streamCh <- conn
+		}
 	}
 }
 
@@ -286,6 +351,8 @@ func (t *NetTransport) udpListen(udpLn net.Listener) {
 			t.logger.Fatal(err)
 		}
 
+		t.logger.Fatalf("got something on pseudo udp port from %v", conn.RemoteAddr().String())
+
 		go func(conn net.Conn, startTime time.Time) {
 			defer conn.Close()
 
@@ -293,6 +360,8 @@ func (t *NetTransport) udpListen(udpLn net.Listener) {
 			if err != nil {
 				t.logger.Fatal(err)
 			}
+
+			t.logger.Printf("Read: %q", msg)
 
 			// TODO: Should we still increase these metrics?
 			// metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
