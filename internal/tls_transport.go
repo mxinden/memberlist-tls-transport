@@ -96,35 +96,12 @@ func NewNetTransport(config *NetTransportConfig) (*NetTransport, error) {
 			return nil, fmt.Errorf("Failed to start TLS listener on %q port %d: %v", addr, port, err)
 		}
 		t.tcpListeners = append(t.tcpListeners, tcpLn)
-
-		// If the config port given was zero, use the first TCP listener
-		// to pick an available port and then apply that to everything
-		// else.
-		if port == 0 {
-			port = tcpLn.Addr().(*net.TCPAddr).Port
-		}
-
-		// TODO: Fix var names.
-		// TODO: Don't just increase port by 3.
-		udpAddr := &net.TCPAddr{IP: ip, Port: port + 3}
-		udpLn, err := tls.Listen("tcp", udpAddr.String(), &tls.Config{
-			Certificates: []tls.Certificate{cer},
-		})
-		if err != nil {
-			return nil, fmt.Errorf("Failed to start TLS packed oriented listener on %q port %d: %v", addr, port, err)
-		}
-		// TODO: Is this still needed?
-		// if err := setUDPRecvBuf(udpLn); err != nil {
-		// 	return nil, fmt.Errorf("Failed to resize UDP buffer: %v", err)
-		// }
-		t.udpListeners = append(t.udpListeners, udpLn)
 	}
 
 	// Fire them up now that we've been able to create them all.
 	for i := 0; i < len(config.BindAddrs); i++ {
-		t.wg.Add(2)
+		t.wg.Add(1)
 		go t.tcpListen(t.tcpListeners[i])
-		go t.udpListen(t.udpListeners[i])
 	}
 
 	ok = true
@@ -259,9 +236,6 @@ func (t *NetTransport) Shutdown() error {
 	for _, conn := range t.tcpListeners {
 		conn.Close()
 	}
-	for _, conn := range t.udpListeners {
-		conn.Close()
-	}
 
 	// Block until all the listener threads have died.
 	t.wg.Wait()
@@ -323,42 +297,6 @@ func (t *NetTransport) tcpListen(ln net.Listener) {
 		} else {
 			t.streamCh <- conn
 		}
-	}
-}
-
-// udpListen is a long running goroutine that accepts incoming UDP packets and
-// hands them off to the packet channel.
-func (t *NetTransport) udpListen(udpLn net.Listener) {
-	defer t.wg.Done()
-
-	for {
-		ts := time.Now()
-
-		conn, err := udpLn.Accept()
-		if err != nil {
-			t.logger.Fatal(err)
-		}
-
-		t.logger.Fatalf("got something on pseudo udp port from %v", conn.RemoteAddr().String())
-
-		go func(conn net.Conn, startTime time.Time) {
-			defer conn.Close()
-
-			msg, err := ioutil.ReadAll(conn)
-			if err != nil {
-				t.logger.Fatal(err)
-			}
-
-			t.logger.Printf("Read: %q", msg)
-
-			// TODO: Should we still increase these metrics?
-			// metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
-			t.packetCh <- &memberlist.Packet{
-				Buf:       msg,
-				From:      conn.RemoteAddr(),
-				Timestamp: startTime,
-			}
-		}(conn, ts)
 	}
 }
 

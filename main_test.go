@@ -13,23 +13,22 @@ import (
 )
 
 func TestJoin(t *testing.T) {
-	list1, err := createMemberlist(9000)
+	list1, err := createMemberlist(9000, nil)
 	if err != nil {
 		panic("failed to create memberlist")
 	}
 
-	list2, err := createMemberlist(9001)
+	list2, err := createMemberlist(9001, nil)
 	if err != nil {
 		panic("failed to create memberlist")
 	}
 
-	n, err := list1.Join([]string{"127.0.0.1:9001"})
+	_, err = list1.Join([]string{"127.0.0.1:9001"})
 	if err != nil {
 		panic("failed to join cluster")
 	}
 
-	fmt.Printf("joined %v clusters", n)
-	n, err = list2.Join([]string{"127.0.0.1:9000"})
+	_, err = list2.Join([]string{"127.0.0.1:9000"})
 	if err != nil {
 		panic("failed to join cluster")
 	}
@@ -49,11 +48,129 @@ func TestJoin(t *testing.T) {
 			t.Errorf("Member: %s %s\n", m.Name, m.Addr)
 		}
 	}
+
+	err = list1.Shutdown()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = list2.Shutdown()
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
-func createMemberlist(port int) (*memberlist.Memberlist, error) {
+type delegate struct {
+	Msgs [][]byte
+}
+
+func (d *delegate) NodeMeta(limit int) []byte {
+	return []byte{}
+}
+
+func (d *delegate) NotifyMsg(m []byte) {
+	d.Msgs = append(d.Msgs, m)
+}
+
+func (d *delegate) GetBroadcasts(overhead, limit int) [][]byte {
+	return [][]byte{}
+}
+
+func (d *delegate) LocalState(join bool) []byte {
+	return []byte{}
+}
+
+func (d *delegate) MergeRemoteState(buf []byte, join bool) {
+}
+
+func TestSendBestEffort(t *testing.T) {
+	msg := "test123"
+	delegate1 := delegate{}
+	list1, err := createMemberlist(9000, &delegate1)
+	if err != nil {
+		panic("failed to create memberlist")
+	}
+
+	delegate2 := delegate{}
+	list2, err := createMemberlist(9001, &delegate2)
+	if err != nil {
+		panic("failed to create memberlist")
+	}
+
+	_, err = list1.Join([]string{"127.0.0.1:9001"})
+	if err != nil {
+		panic("failed to join cluster")
+	}
+
+	// TODO: Make sure we are not sending to ourself
+	err = list1.SendBestEffort(list2.Members()[1], []byte(msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(time.Second)
+
+	if len(delegate2.Msgs) != 1 {
+		t.Fatalf("expected delegate2 to have one messsage but got: %v", len(delegate2.Msgs))
+	}
+
+	err = list1.Shutdown()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = list2.Shutdown()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSendReliable(t *testing.T) {
+	msg := "test123"
+	delegate1 := delegate{}
+	list1, err := createMemberlist(9000, &delegate1)
+	if err != nil {
+		panic("failed to create memberlist")
+	}
+
+	delegate2 := delegate{}
+	list2, err := createMemberlist(9001, &delegate2)
+	if err != nil {
+		panic("failed to create memberlist")
+	}
+
+	_, err = list1.Join([]string{"127.0.0.1:9001"})
+	if err != nil {
+		panic("failed to join cluster")
+	}
+
+	// TODO: Make sure we are not sending to ourself
+	err = list1.SendReliable(list2.Members()[1], []byte(msg))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(time.Second)
+
+	if len(delegate2.Msgs) != 1 {
+		t.Fatalf("expected delegate2 to have one messsage but got: %v", len(delegate2.Msgs))
+	}
+
+	err = list1.Shutdown()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = list2.Shutdown()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func createMemberlist(port int, d memberlist.Delegate) (*memberlist.Memberlist, error) {
 	conf := memberlist.DefaultLocalConfig()
 	conf.UDPBufferSize = 1
+
+	if d != nil {
+		conf.Delegate = d
+	}
 
 	conf.Name = fmt.Sprintf("cluster-%v", port)
 
