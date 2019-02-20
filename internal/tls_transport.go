@@ -83,6 +83,7 @@ func NewNetTransport(config *NetTransportConfig) (*NetTransport, error) {
 	for _, addr := range config.BindAddrs {
 		ip := net.ParseIP(addr)
 
+		// Generated via https://github.com/wolfeidau/golang-massl
 		caCert, err := ioutil.ReadFile("./certs/ca.pem")
 		if err != nil {
 			log.Fatalf("failed to load cert: %s", err)

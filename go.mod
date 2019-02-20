@@ -1,1 +1,1 @@
-module github.com/mxinden/tls-memberlist
+module github.com/mxinden/memberlist-tls-transport

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/memberlist"
-	"github.com/mxinden/tls_memberlist/internal"
+	"github.com/mxinden/memberlist-tls-transport/internal"
 )
 
 func TestJoin(t *testing.T) {
