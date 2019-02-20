@@ -5,13 +5,14 @@ import (
 	"log"
 	"os"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/hashicorp/memberlist"
 	"github.com/mxinden/tls_memberlist/internal"
 )
 
-func main() {
+func TestJoin(t *testing.T) {
 	list1, err := createMemberlist(9000)
 	if err != nil {
 		panic("failed to create memberlist")
@@ -32,16 +33,21 @@ func main() {
 	if err != nil {
 		panic("failed to join cluster")
 	}
-	fmt.Printf("joined %v clusters", n)
 
-	time.Sleep(time.Second * 30)
+	time.Sleep(2 * time.Second)
 
-	for _, m := range list1.Members() {
-		fmt.Printf("Member: %s %s\n", m.Name, m.Addr)
-	}
+	if len(list1.Members()) != 2 || len(list2.Members()) != 2 {
+		t.Errorf("expected each memberlist to have 2 members but got %v and %v instead", len(list1.Members()), len(list2.Members()))
 
-	for _, m := range list2.Members() {
-		fmt.Printf("Member: %s %s\n", m.Name, m.Addr)
+		t.Error("List 1:")
+		for _, m := range list1.Members() {
+			t.Errorf("Member: %s %s\n", m.Name, m.Addr)
+		}
+
+		t.Error("List 2:")
+		for _, m := range list2.Members() {
+			t.Errorf("Member: %s %s\n", m.Name, m.Addr)
+		}
 	}
 }
 

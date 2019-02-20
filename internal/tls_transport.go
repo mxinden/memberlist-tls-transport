@@ -89,7 +89,6 @@ func NewNetTransport(config *NetTransportConfig) (*NetTransport, error) {
 		}
 
 		tcpAddr := &net.TCPAddr{IP: ip, Port: port}
-		config.Logger.Printf("tcp address: %v", tcpAddr.String())
 		tcpLn, err := tls.Listen("tcp", tcpAddr.String(), &tls.Config{
 			Certificates: []tls.Certificate{cer},
 		})
@@ -108,7 +107,6 @@ func NewNetTransport(config *NetTransportConfig) (*NetTransport, error) {
 		// TODO: Fix var names.
 		// TODO: Don't just increase port by 3.
 		udpAddr := &net.TCPAddr{IP: ip, Port: port + 3}
-		config.Logger.Printf("pseudo tcp address: %v", udpAddr.String())
 		udpLn, err := tls.Listen("tcp", udpAddr.String(), &tls.Config{
 			Certificates: []tls.Certificate{cer},
 		})
@@ -189,8 +187,6 @@ func (t *NetTransport) FinalAdvertiseAddr(ip string, port int) (net.IP, int, err
 
 // See Transport.
 func (t *NetTransport) WriteTo(b []byte, addr string) (time.Time, error) {
-	fmt.Println("Write to address: ", addr)
-
 	roots := x509.NewCertPool()
 
 	conn, err := tls.Dial("tcp", addr, &tls.Config{
@@ -215,8 +211,6 @@ func (t *NetTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 		t.logger.Println(err)
 		return time.Time{}, err
 	}
-
-	t.logger.Printf("Wrote: %q", b)
 
 	return time.Now(), nil
 }
@@ -304,8 +298,6 @@ func (t *NetTransport) tcpListen(ln net.Listener) {
 				t.logger.Fatal(err)
 			}
 
-			t.logger.Printf("#### got the following port: %v", string(remotePort))
-
 			parsedPort, err := strconv.Atoi(string(remotePort))
 			if err != nil {
 				t.logger.Fatal(err)
@@ -316,14 +308,10 @@ func (t *NetTransport) tcpListen(ln net.Listener) {
 				t.logger.Fatal(err)
 			}
 
-			t.logger.Printf("Read: %q", msg)
-
 			addr := &net.TCPAddr{
 				IP:   []byte{127, 0, 0, 1},
 				Port: parsedPort,
 			}
-
-			t.logger.Printf("### Address: %v", addr)
 
 			// TODO: Should we still increase these metrics?
 			// metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
