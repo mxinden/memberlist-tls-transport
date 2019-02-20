@@ -83,15 +83,27 @@ func NewNetTransport(config *NetTransportConfig) (*NetTransport, error) {
 	for _, addr := range config.BindAddrs {
 		ip := net.ParseIP(addr)
 
-		cer, err := tls.LoadX509KeyPair("server.crt", "server.key")
+		caCert, err := ioutil.ReadFile("./certs/ca.pem")
+		if err != nil {
+			log.Fatalf("failed to load cert: %s", err)
+		}
+
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+
+		cert, err := tls.LoadX509KeyPair("./certs/server.pem", "./certs/server-key.pem")
 		if err != nil {
 			return nil, fmt.Errorf("%v", err)
 		}
 
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},        // server certificate which is validated by the client
+			ClientCAs:    caCertPool,                     // used to verify the client cert is signed by the CA and is therefore valid
+			ClientAuth:   tls.RequireAndVerifyClientCert, // this requires a valid client certificate to be supplied during handshake
+		}
+
 		tcpAddr := &net.TCPAddr{IP: ip, Port: port}
-		tcpLn, err := tls.Listen("tcp", tcpAddr.String(), &tls.Config{
-			Certificates: []tls.Certificate{cer},
-		})
+		tcpLn, err := tls.Listen("tcp", tcpAddr.String(), tlsConfig)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to start TLS listener on %q port %d: %v", addr, port, err)
 		}
@@ -164,13 +176,24 @@ func (t *NetTransport) FinalAdvertiseAddr(ip string, port int) (net.IP, int, err
 
 // See Transport.
 func (t *NetTransport) WriteTo(b []byte, addr string) (time.Time, error) {
-	roots := x509.NewCertPool()
 
-	conn, err := tls.Dial("tcp", addr, &tls.Config{
-		RootCAs: roots,
-		// TODO: Remove InsecureSkipVerify.
-		InsecureSkipVerify: true,
-	})
+	cert, err := tls.LoadX509KeyPair("./certs/client.pem", "./certs/client-key.pem")
+
+	caCert, err := ioutil.ReadFile("./certs/ca.pem")
+	if err != nil {
+		log.Fatalf("failed to load cert: %s", err)
+	}
+
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert}, // this certificate is used to sign the handshake
+		RootCAs:      caCertPool,              // this is used to validate the server certificate
+	}
+	tlsConfig.BuildNameToCertificate()
+
+	conn, err := tls.Dial("tcp", addr, tlsConfig)
 	if err != nil {
 		t.logger.Println(err)
 		return time.Time{}, err
@@ -199,16 +222,23 @@ func (t *NetTransport) PacketCh() <-chan *memberlist.Packet {
 
 // See Transport.
 func (t *NetTransport) DialTimeout(addr string, timeout time.Duration) (net.Conn, error) {
-	roots := x509.NewCertPool()
+	cert, err := tls.LoadX509KeyPair("./certs/client.pem", "./certs/client-key.pem")
 
-	// TODO: What about dialer timeout like:
-	// dialer := net.Dialer{Timeout: timeout}
+	caCert, err := ioutil.ReadFile("./certs/ca.pem")
+	if err != nil {
+		log.Fatalf("failed to load cert: %s", err)
+	}
 
-	conn, err := tls.Dial("tcp", addr, &tls.Config{
-		RootCAs: roots,
-		// TODO: Remove InsecureSkipVerify.
-		InsecureSkipVerify: true,
-	})
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert}, // this certificate is used to sign the handshake
+		RootCAs:      caCertPool,              // this is used to validate the server certificate
+	}
+	tlsConfig.BuildNameToCertificate()
+
+	conn, err := tls.Dial("tcp", addr, tlsConfig)
 	if err != nil {
 		return nil, err
 	}
