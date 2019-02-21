@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/hashicorp/memberlist"
-	"github.com/mxinden/memberlist-tls-transport/internal"
 )
 
 func TestJoin(t *testing.T) {
@@ -179,7 +178,7 @@ func createMemberlist(port int, d memberlist.Delegate) (*memberlist.Memberlist, 
 	conf.Logger = log.New(os.Stderr, "", log.LstdFlags)
 
 	// TODO: Should be tls transport config.
-	nc := &internal.NetTransportConfig{
+	nc := NetTransportConfig{
 		BindAddrs: []string{conf.BindAddr},
 		BindPort:  conf.BindPort,
 		// TODO: insert proper logger.
@@ -187,11 +186,11 @@ func createMemberlist(port int, d memberlist.Delegate) (*memberlist.Memberlist, 
 	}
 
 	// See comment below for details about the retry in here.
-	makeNetRetry := func(limit int) (*internal.NetTransport, error) {
+	makeNetRetry := func(limit int) (*NetTransport, error) {
 		var err error
 		for try := 0; try < limit; try++ {
-			var nt *internal.NetTransport
-			if nt, err = internal.NewNetTransport(nc); err == nil {
+			var nt *NetTransport
+			if nt, err = NewNetTransport(&nc); err == nil {
 				return nt, nil
 			}
 			if strings.Contains(err.Error(), "address already in use") {
