@@ -177,8 +177,7 @@ func createMemberlist(port int, d memberlist.Delegate) (*memberlist.Memberlist, 
 	conf.BindAddr = "127.0.0.1"
 	conf.Logger = log.New(os.Stderr, "", log.LstdFlags)
 
-	// TODO: Should be tls transport config.
-	nc := NetTransportConfig{
+	nc := TLSTransportConfig{
 		BindAddrs: []string{conf.BindAddr},
 		BindPort:  conf.BindPort,
 		// TODO: insert proper logger.
@@ -186,11 +185,11 @@ func createMemberlist(port int, d memberlist.Delegate) (*memberlist.Memberlist, 
 	}
 
 	// See comment below for details about the retry in here.
-	makeNetRetry := func(limit int) (*NetTransport, error) {
+	makeNetRetry := func(limit int) (*TLSTransport, error) {
 		var err error
 		for try := 0; try < limit; try++ {
-			var nt *NetTransport
-			if nt, err = NewNetTransport(&nc); err == nil {
+			var nt *TLSTransport
+			if nt, err = NewTLSTransport(&nc); err == nil {
 				return nt, nil
 			}
 			if strings.Contains(err.Error(), "address already in use") {

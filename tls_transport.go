@@ -19,18 +19,8 @@ import (
 	"github.com/hashicorp/memberlist"
 )
 
-const (
-	// udpPacketBufSize is used to buffer incoming packets during read
-	// operations.
-	udpPacketBufSize = 65536
-
-	// udpRecvBufSize is a large buffer size that we attempt to set UDP
-	// sockets to in order to handle a large volume of messages.
-	udpRecvBufSize = 2 * 1024 * 1024
-)
-
-// NetTransportConfig is used to configure a net transport.
-type NetTransportConfig struct {
+// TLSTransportConfig is used to configure a net transport.
+type TLSTransportConfig struct {
 	// BindAddrs is a list of addresses to bind to for both TCP and UDP
 	// communications.
 	BindAddrs []string
@@ -42,22 +32,21 @@ type NetTransportConfig struct {
 	Logger *log.Logger
 }
 
-// NetTransport is a Transport implementation that uses connectionless UDP for
+// TLSTransport is a Transport implementation that uses connectionless UDP for
 // packet operations, and ad-hoc TCP connections for stream operations.
-type NetTransport struct {
-	config       *NetTransportConfig
+type TLSTransport struct {
+	config       *TLSTransportConfig
 	packetCh     chan *memberlist.Packet
 	streamCh     chan net.Conn
 	logger       *log.Logger
 	wg           sync.WaitGroup
 	tcpListeners []net.Listener
-	udpListeners []net.Listener
 	shutdown     int32
 }
 
-// NewNetTransport returns a net transport with the given configuration. On
+// NewTLSTransport returns a net transport with the given configuration. On
 // success all the network listeners will be created and listening.
-func NewNetTransport(config *NetTransportConfig) (*NetTransport, error) {
+func NewTLSTransport(config *TLSTransportConfig) (*TLSTransport, error) {
 	// If we reject the empty list outright we can assume that there's at
 	// least one listener of each type later during operation.
 	if len(config.BindAddrs) == 0 {
@@ -66,7 +55,7 @@ func NewNetTransport(config *NetTransportConfig) (*NetTransport, error) {
 
 	// Build out the new transport.
 	var ok bool
-	t := NetTransport{
+	t := TLSTransport{
 		config:   config,
 		packetCh: make(chan *memberlist.Packet),
 		streamCh: make(chan net.Conn),
@@ -125,14 +114,14 @@ func NewNetTransport(config *NetTransportConfig) (*NetTransport, error) {
 
 // GetAutoBindPort returns the bind port that was automatically given by the
 // kernel, if a bind port of 0 was given.
-func (t *NetTransport) GetAutoBindPort() int {
+func (t *TLSTransport) GetAutoBindPort() int {
 	// We made sure there's at least one TCP listener, and that one's
 	// port was applied to all the others for the dynamic bind case.
 	return t.tcpListeners[0].Addr().(*net.TCPAddr).Port
 }
 
 // See Transport.
-func (t *NetTransport) FinalAdvertiseAddr(ip string, port int) (net.IP, int, error) {
+func (t *TLSTransport) FinalAdvertiseAddr(ip string, port int) (net.IP, int, error) {
 	var advertiseAddr net.IP
 	var advertisePort int
 	if ip != "" {
@@ -178,7 +167,7 @@ func (t *NetTransport) FinalAdvertiseAddr(ip string, port int) (net.IP, int, err
 }
 
 // See Transport.
-func (t *NetTransport) WriteTo(b []byte, addr string) (time.Time, error) {
+func (t *TLSTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 
 	cert, err := tls.LoadX509KeyPair("./certs/client.pem", "./certs/client-key.pem")
 
@@ -219,12 +208,12 @@ func (t *NetTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 }
 
 // See Transport.
-func (t *NetTransport) PacketCh() <-chan *memberlist.Packet {
+func (t *TLSTransport) PacketCh() <-chan *memberlist.Packet {
 	return t.packetCh
 }
 
 // See Transport.
-func (t *NetTransport) DialTimeout(addr string, timeout time.Duration) (net.Conn, error) {
+func (t *TLSTransport) DialTimeout(addr string, timeout time.Duration) (net.Conn, error) {
 	cert, err := tls.LoadX509KeyPair("./certs/client.pem", "./certs/client-key.pem")
 
 	caCert, err := ioutil.ReadFile("./certs/ca.pem")
@@ -256,12 +245,12 @@ func (t *NetTransport) DialTimeout(addr string, timeout time.Duration) (net.Conn
 }
 
 // See Transport.
-func (t *NetTransport) StreamCh() <-chan net.Conn {
+func (t *TLSTransport) StreamCh() <-chan net.Conn {
 	return t.streamCh
 }
 
 // See Transport.
-func (t *NetTransport) Shutdown() error {
+func (t *TLSTransport) Shutdown() error {
 	// This will avoid log spam about errors when we shut down.
 	atomic.StoreInt32(&t.shutdown, 1)
 
@@ -277,7 +266,7 @@ func (t *NetTransport) Shutdown() error {
 
 // tcpListen is a long running goroutine that accepts incoming TCP connections
 // and hands them off to the stream channel.
-func (t *NetTransport) tcpListen(ln net.Listener) {
+func (t *TLSTransport) tcpListen(ln net.Listener) {
 	defer t.wg.Done()
 	for {
 		ts := time.Now()
@@ -331,19 +320,4 @@ func (t *NetTransport) tcpListen(ln net.Listener) {
 			t.streamCh <- conn
 		}
 	}
-}
-
-// setUDPRecvBuf is used to resize the UDP receive window. The function
-// attempts to set the read buffer to `udpRecvBuf` but backs off until
-// the read buffer can be set.
-func setUDPRecvBuf(c *net.UDPConn) error {
-	size := udpRecvBufSize
-	var err error
-	for size > 0 {
-		if err = c.SetReadBuffer(size); err == nil {
-			return nil
-		}
-		size = size / 2
-	}
-	return err
 }
