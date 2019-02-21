@@ -1,6 +1,6 @@
 # Memberlist TLS Transport
 
-Status: Prove of concept
+**Status: Prove of concept**
 
 This is a fork of [Memberlist](https://github.com/hashicorp/memberlist)'s
 [`NetTransport`](https://github.com/hashicorp/memberlist/blob/master/net_transport.go)
