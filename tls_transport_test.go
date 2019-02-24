@@ -9,25 +9,27 @@ import (
 	"time"
 
 	"github.com/hashicorp/memberlist"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/require"
 )
 
 func TestJoin(t *testing.T) {
-	list1, err := createMemberlist(9000, nil)
+	list1, err := createMemberlist(nil, prometheus.NewRegistry())
 	if err != nil {
 		panic("failed to create memberlist")
 	}
 
-	list2, err := createMemberlist(9001, nil)
+	list2, err := createMemberlist(nil, prometheus.NewRegistry())
 	if err != nil {
 		panic("failed to create memberlist")
 	}
 
-	_, err = list1.Join([]string{"127.0.0.1:9001"})
+	_, err = list1.Join([]string{list2.LocalNode().Address()})
 	if err != nil {
 		panic("failed to join cluster")
 	}
 
-	_, err = list2.Join([]string{"127.0.0.1:9000"})
+	_, err = list2.Join([]string{list1.LocalNode().Address()})
 	if err != nil {
 		panic("failed to join cluster")
 	}
@@ -84,18 +86,23 @@ func (d *delegate) MergeRemoteState(buf []byte, join bool) {
 func TestSendBestEffort(t *testing.T) {
 	msg := "test123"
 	delegate1 := delegate{}
-	list1, err := createMemberlist(9000, &delegate1)
+	list1, err := createMemberlist(&delegate1, prometheus.NewRegistry())
 	if err != nil {
 		panic("failed to create memberlist")
 	}
 
 	delegate2 := delegate{}
-	list2, err := createMemberlist(9001, &delegate2)
+	list2, err := createMemberlist(&delegate2, prometheus.NewRegistry())
 	if err != nil {
 		panic("failed to create memberlist")
 	}
 
-	_, err = list1.Join([]string{"127.0.0.1:9001"})
+	_, err = list1.Join([]string{list2.LocalNode().Address()})
+	if err != nil {
+		panic("failed to join cluster")
+	}
+
+	_, err = list2.Join([]string{list1.LocalNode().Address()})
 	if err != nil {
 		panic("failed to join cluster")
 	}
@@ -125,18 +132,23 @@ func TestSendBestEffort(t *testing.T) {
 func TestSendReliable(t *testing.T) {
 	msg := "test123"
 	delegate1 := delegate{}
-	list1, err := createMemberlist(9000, &delegate1)
+	list1, err := createMemberlist(&delegate1, prometheus.NewRegistry())
 	if err != nil {
 		panic("failed to create memberlist")
 	}
 
 	delegate2 := delegate{}
-	list2, err := createMemberlist(9001, &delegate2)
+	list2, err := createMemberlist(&delegate2, prometheus.NewRegistry())
 	if err != nil {
 		panic("failed to create memberlist")
 	}
 
-	_, err = list1.Join([]string{"127.0.0.1:9001"})
+	_, err = list1.Join([]string{list2.LocalNode().Address()})
+	if err != nil {
+		panic("failed to join cluster")
+	}
+
+	_, err = list2.Join([]string{list1.LocalNode().Address()})
 	if err != nil {
 		panic("failed to join cluster")
 	}
@@ -163,17 +175,30 @@ func TestSendReliable(t *testing.T) {
 	}
 }
 
-func createMemberlist(port int, d memberlist.Delegate) (*memberlist.Memberlist, error) {
+func TestRegistersMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	_, err := createMemberlist(nil, reg)
+	if err != nil {
+		panic("failed to create memberlist")
+	}
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	require.Equal(t, 1, len(families), "unexpected length of metric families")
+}
+
+func createMemberlist(d memberlist.Delegate, reg prometheus.Registerer) (*memberlist.Memberlist, error) {
 	conf := memberlist.DefaultLocalConfig()
-	conf.UDPBufferSize = 1
+	// Let OS choose port so parallel unit tests don't conflict.
+	conf.BindPort = 0
 
 	if d != nil {
 		conf.Delegate = d
 	}
 
-	conf.Name = fmt.Sprintf("cluster-%v", port)
-
-	conf.BindPort = port
 	conf.BindAddr = "127.0.0.1"
 	conf.Logger = log.New(os.Stderr, "", log.LstdFlags)
 
@@ -189,7 +214,7 @@ func createMemberlist(port int, d memberlist.Delegate) (*memberlist.Memberlist, 
 		var err error
 		for try := 0; try < limit; try++ {
 			var nt *TLSTransport
-			if nt, err = NewTLSTransport(&nc); err == nil {
+			if nt, err = NewTLSTransport(&nc, reg); err == nil {
 				return nt, nil
 			}
 			if strings.Contains(err.Error(), "address already in use") {
@@ -212,6 +237,8 @@ func createMemberlist(port int, d memberlist.Delegate) (*memberlist.Memberlist, 
 		limit = 10
 	}
 
+	fmt.Println("limit: ", limit)
+
 	nt, err := makeNetRetry(limit)
 	if err != nil {
 		panic(fmt.Sprintf("Could not set up network transport: %v", err))
@@ -223,6 +250,8 @@ func createMemberlist(port int, d memberlist.Delegate) (*memberlist.Memberlist, 
 		conf.Logger.Printf("[DEBUG] memberlist: Using dynamic bind port %d", port)
 	}
 	conf.Transport = nt
+
+	conf.Name = fmt.Sprintf("cluster-%v", conf.BindPort)
 
 	return memberlist.Create(conf)
 }

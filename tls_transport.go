@@ -7,6 +7,9 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io/ioutil"
+	"strings"
+
+	"bufio"
 	"log"
 	"net"
 	"strconv"
@@ -17,6 +20,7 @@ import (
 	// "github.com/armon/go-metrics"
 	sockaddr "github.com/hashicorp/go-sockaddr"
 	"github.com/hashicorp/memberlist"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // TLSTransportConfig is used to configure a net transport.
@@ -42,11 +46,13 @@ type TLSTransport struct {
 	wg           sync.WaitGroup
 	tcpListeners []net.Listener
 	shutdown     int32
+
+	tcpConnEstablished prometheus.Counter
 }
 
 // NewTLSTransport returns a net transport with the given configuration. On
 // success all the network listeners will be created and listening.
-func NewTLSTransport(config *TLSTransportConfig) (*TLSTransport, error) {
+func NewTLSTransport(config *TLSTransportConfig, reg prometheus.Registerer) (*TLSTransport, error) {
 	// If we reject the empty list outright we can assume that there's at
 	// least one listener of each type later during operation.
 	if len(config.BindAddrs) == 0 {
@@ -62,6 +68,8 @@ func NewTLSTransport(config *TLSTransportConfig) (*TLSTransport, error) {
 		logger:   config.Logger,
 	}
 
+	t.registerMetrics(reg)
+
 	// Clean up listeners if there's an error.
 	defer func() {
 		if !ok {
@@ -69,7 +77,7 @@ func NewTLSTransport(config *TLSTransportConfig) (*TLSTransport, error) {
 		}
 	}()
 
-	// Build all the TCP and UDP listeners.
+	// Build all the TCP listeners.
 	port := config.BindPort
 	for _, addr := range config.BindAddrs {
 		ip := net.ParseIP(addr)
@@ -110,6 +118,15 @@ func NewTLSTransport(config *TLSTransportConfig) (*TLSTransport, error) {
 
 	ok = true
 	return &t, nil
+}
+
+func (t *TLSTransport) registerMetrics(reg prometheus.Registerer) {
+	t.tcpConnEstablished = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "memberlist_tls_transport_tcp_conn_established",
+		Help: "Amount of tcp connections established for memberlist's tls transport layer.",
+	})
+
+	reg.MustRegister(t.tcpConnEstablished)
 }
 
 // GetAutoBindPort returns the bind port that was automatically given by the
@@ -190,13 +207,17 @@ func (t *TLSTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 		t.logger.Println(err)
 		return time.Time{}, err
 	}
-
 	defer conn.Close()
 
-	// Signal that this is a packet connection.
-	conn.Write([]byte{'p'})
+	t.tcpConnEstablished.Inc()
 
-	conn.Write([]byte(strconv.Itoa(t.config.BindPort)))
+	// Signal that this is a packet connection.
+	conn.Write([]byte{'p', '\n'})
+
+	// TODO: This might only be the private, not the public address. We should
+	// probably send the advertise address down the wire.
+	conn.Write([]byte(t.tcpListeners[0].Addr().String()))
+	conn.Write([]byte{'\n'})
 
 	_, err = conn.Write(b)
 	if err != nil {
@@ -235,8 +256,10 @@ func (t *TLSTransport) DialTimeout(addr string, timeout time.Duration) (net.Conn
 		return nil, err
 	}
 
+	t.tcpConnEstablished.Inc()
+
 	// Signal that this is a stream connection.
-	_, err = conn.Write([]byte{'s'})
+	_, err = conn.Write([]byte{'s', '\n'})
 	if err != nil {
 		return nil, err
 	}
@@ -280,33 +303,42 @@ func (t *TLSTransport) tcpListen(ln net.Listener) {
 			continue
 		}
 
-		b := make([]byte, 1)
+		reader := bufio.NewReader(conn)
 
-		if _, err := conn.Read(b); err != nil {
-			t.logger.Fatal(err)
+		connType, err := reader.ReadString('\n')
+		if err != nil {
+			t.logger.Fatalf("failed to read connection type: %v", err)
 		}
+		connType = strings.Trim(connType, "\n")
 
-		if b[0] == 'p' {
+		if connType == "p" {
 			defer conn.Close()
 
-			remotePort := make([]byte, 4)
-			if _, err := conn.Read(remotePort); err != nil {
-				t.logger.Fatal(err)
+			remoteAddr, err := reader.ReadString('\n')
+			if err != nil {
+				t.logger.Fatalf("failed to read remote address: %v", err)
 			}
 
-			parsedPort, err := strconv.Atoi(string(remotePort))
+			remoteAddr = strings.Trim(remoteAddr, "\n")
+
+			host, portString, err := net.SplitHostPort(remoteAddr)
 			if err != nil {
 				t.logger.Fatal(err)
 			}
 
-			msg, err := ioutil.ReadAll(conn)
+			port, err := strconv.Atoi(portString)
 			if err != nil {
 				t.logger.Fatal(err)
 			}
 
 			addr := &net.TCPAddr{
-				IP:   []byte{127, 0, 0, 1},
-				Port: parsedPort,
+				IP:   net.ParseIP(host),
+				Port: port,
+			}
+
+			msg, err := ioutil.ReadAll(conn)
+			if err != nil {
+				t.logger.Fatal(err)
 			}
 
 			// TODO: Should we still increase these metrics?
