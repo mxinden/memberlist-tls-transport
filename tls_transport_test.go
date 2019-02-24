@@ -60,6 +60,62 @@ func TestJoin(t *testing.T) {
 	}
 }
 
+func TestReusePacketTCPConnections(t *testing.T) {
+	list1Registry := prometheus.NewRegistry()
+	list1, err := createMemberlist(nil, list1Registry)
+	if err != nil {
+		panic("failed to create memberlist")
+	}
+
+	list2, err := createMemberlist(nil, prometheus.NewRegistry())
+	if err != nil {
+		panic("failed to create memberlist")
+	}
+
+	_, err = list1.Join([]string{list2.LocalNode().Address()})
+	if err != nil {
+		panic("failed to join cluster")
+	}
+
+	_, err = list2.Join([]string{list1.LocalNode().Address()})
+	if err != nil {
+		panic("failed to join cluster")
+	}
+
+	time.Sleep(10 * time.Second)
+
+	if len(list1.Members()) != 2 || len(list2.Members()) != 2 {
+		t.Errorf("expected each memberlist to have 2 members but got %v and %v instead", len(list1.Members()), len(list2.Members()))
+
+		t.Error("List 1:")
+		for _, m := range list1.Members() {
+			t.Errorf("Member: %s %s\n", m.Name, m.Addr)
+		}
+
+		t.Error("List 2:")
+		for _, m := range list2.Members() {
+			t.Errorf("Member: %s %s\n", m.Name, m.Addr)
+		}
+	}
+
+	err = list1.Shutdown()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = list2.Shutdown()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	metricFamilies, err := list1Registry.Gather()
+	if err != nil {
+		t.Fatalf("failed to get metric families: %v", err)
+	}
+
+	numberTCPConnEstablished := metricFamilies[0].GetMetric()[0].GetCounter().GetValue()
+	require.Equal(t, float64(5), numberTCPConnEstablished, "unexpected amount of established connections")
+}
+
 type delegate struct {
 	Msgs [][]byte
 }

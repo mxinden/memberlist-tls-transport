@@ -3,16 +3,16 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"io/ioutil"
-	"strings"
-
-	"bufio"
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,6 +48,8 @@ type TLSTransport struct {
 	shutdown     int32
 
 	tcpConnEstablished prometheus.Counter
+
+	connPool map[string]net.Conn
 }
 
 // NewTLSTransport returns a net transport with the given configuration. On
@@ -66,6 +68,7 @@ func NewTLSTransport(config *TLSTransportConfig, reg prometheus.Registerer) (*TL
 		packetCh: make(chan *memberlist.Packet),
 		streamCh: make(chan net.Conn),
 		logger:   config.Logger,
+		connPool: map[string]net.Conn{},
 	}
 
 	t.registerMetrics(reg)
@@ -183,9 +186,7 @@ func (t *TLSTransport) FinalAdvertiseAddr(ip string, port int) (net.IP, int, err
 	return advertiseAddr, advertisePort, nil
 }
 
-// See Transport.
-func (t *TLSTransport) WriteTo(b []byte, addr string) (time.Time, error) {
-
+func (t *TLSTransport) dial(addr string) (net.Conn, error) {
 	cert, err := tls.LoadX509KeyPair("./certs/client.pem", "./certs/client-key.pem")
 
 	caCert, err := ioutil.ReadFile("./certs/ca.pem")
@@ -205,21 +206,49 @@ func (t *TLSTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 	conn, err := tls.Dial("tcp", addr, tlsConfig)
 	if err != nil {
 		t.logger.Println(err)
-		return time.Time{}, err
+		return nil, err
 	}
-	defer conn.Close()
 
 	t.tcpConnEstablished.Inc()
 
-	// Signal that this is a packet connection.
-	conn.Write([]byte{'p', '\n'})
+	return conn, nil
+}
 
-	// TODO: This might only be the private, not the public address. We should
-	// probably send the advertise address down the wire.
-	conn.Write([]byte(t.tcpListeners[0].Addr().String()))
-	conn.Write([]byte{'\n'})
+// See Transport.
+func (t *TLSTransport) WriteTo(b []byte, addr string) (time.Time, error) {
+	var (
+		conn net.Conn
+		ok   bool
+		err  error
+	)
+	// TODO: This is not yet thread safe.
+	if conn, ok = t.connPool[addr]; !ok {
+		conn, err = t.dial(addr)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to create new packet connection: %v", err)
+		}
+		t.connPool[addr] = conn
 
-	_, err = conn.Write(b)
+		// Signal that this is a packet connection.
+		conn.Write([]byte{'p', '\n'})
+
+		// TODO: This might only be the private, not the public address. We should
+		// probably send the advertise address down the wire.
+		conn.Write([]byte(t.tcpListeners[0].Addr().String()))
+		conn.Write([]byte{'\n'})
+	}
+
+	// TODO: This is probably not performing very well. How about prefixing each msg
+	// with a length and reading just as far as the length?
+	msg := base64.StdEncoding.EncodeToString(b)
+
+	_, err = conn.Write([]byte(msg))
+	if err != nil {
+		t.logger.Println(err)
+		return time.Time{}, err
+	}
+
+	_, err = conn.Write([]byte{'\n'})
 	if err != nil {
 		t.logger.Println(err)
 		return time.Time{}, err
@@ -235,28 +264,10 @@ func (t *TLSTransport) PacketCh() <-chan *memberlist.Packet {
 
 // See Transport.
 func (t *TLSTransport) DialTimeout(addr string, timeout time.Duration) (net.Conn, error) {
-	cert, err := tls.LoadX509KeyPair("./certs/client.pem", "./certs/client-key.pem")
-
-	caCert, err := ioutil.ReadFile("./certs/ca.pem")
+	conn, err := t.dial(addr)
 	if err != nil {
-		log.Fatalf("failed to load cert: %s", err)
+		return nil, fmt.Errorf("failed to create stream connection: %v", err)
 	}
-
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert}, // this certificate is used to sign the handshake
-		RootCAs:      caCertPool,              // this is used to validate the server certificate
-	}
-	tlsConfig.BuildNameToCertificate()
-
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	t.tcpConnEstablished.Inc()
 
 	// Signal that this is a stream connection.
 	_, err = conn.Write([]byte{'s', '\n'})
@@ -312,8 +323,6 @@ func (t *TLSTransport) tcpListen(ln net.Listener) {
 		connType = strings.Trim(connType, "\n")
 
 		if connType == "p" {
-			defer conn.Close()
-
 			remoteAddr, err := reader.ReadString('\n')
 			if err != nil {
 				t.logger.Fatalf("failed to read remote address: %v", err)
@@ -336,18 +345,29 @@ func (t *TLSTransport) tcpListen(ln net.Listener) {
 				Port: port,
 			}
 
-			msg, err := ioutil.ReadAll(conn)
-			if err != nil {
-				t.logger.Fatal(err)
-			}
+			go func() {
+				for {
+					msgB64, err := reader.ReadString('\n')
+					if err != nil {
+						t.logger.Fatalf("failed to read message from packet connection: %v", err)
+					}
+					msgB64 = strings.Trim(msgB64, "\n")
 
-			// TODO: Should we still increase these metrics?
-			// metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
-			t.packetCh <- &memberlist.Packet{
-				Buf:       msg,
-				From:      addr,
-				Timestamp: ts,
-			}
+					msg, err := base64.StdEncoding.DecodeString(msgB64)
+					if err != nil {
+						t.logger.Fatalf("failed to base64 decode packet message: %v", err)
+					}
+
+					// TODO: Should we still increase these metrics?
+					// metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
+					t.packetCh <- &memberlist.Packet{
+						Buf:       []byte(msg),
+						From:      addr,
+						Timestamp: ts,
+					}
+				}
+			}()
+
 		} else {
 			t.streamCh <- conn
 		}
