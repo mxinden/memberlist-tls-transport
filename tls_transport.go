@@ -18,6 +18,7 @@ import (
 	"time"
 
 	// "github.com/armon/go-metrics"
+	"github.com/golang/groupcache/lru"
 	sockaddr "github.com/hashicorp/go-sockaddr"
 	"github.com/hashicorp/memberlist"
 	"github.com/prometheus/client_golang/prometheus"
@@ -49,7 +50,10 @@ type TLSTransport struct {
 
 	tcpConnEstablished prometheus.Counter
 
-	connPool map[string]net.Conn
+	// Don't use RWMutex. connPool.Get records the recent usage, hence
+	// concurrent Gets are not safe.
+	connPoolLock sync.Mutex
+	connPool     *lru.Cache
 }
 
 // NewTLSTransport returns a net transport with the given configuration. On
@@ -68,7 +72,16 @@ func NewTLSTransport(config *TLSTransportConfig, reg prometheus.Registerer) (*TL
 		packetCh: make(chan *memberlist.Packet),
 		streamCh: make(chan net.Conn),
 		logger:   config.Logger,
-		connPool: map[string]net.Conn{},
+		// TODO: How about using the current instance count here instead? Should
+		// probably be a safe default.
+		connPool: lru.New(5),
+	}
+
+	t.connPool.OnEvicted = func(key lru.Key, conn interface{}) {
+		err := conn.(net.Conn).Close()
+		if err != nil {
+			log.Fatalf("failed to close tls connection triggered by lru cache evection: %v", err)
+		}
 	}
 
 	t.registerMetrics(reg)
@@ -218,37 +231,39 @@ func (t *TLSTransport) dial(addr string) (net.Conn, error) {
 func (t *TLSTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 	var (
 		conn net.Conn
-		ok   bool
 		err  error
 	)
-	// TODO: This is not yet thread safe.
-	if conn, ok = t.connPool[addr]; !ok {
+
+	t.connPoolLock.Lock()
+
+	if c, ok := t.connPool.Get(addr); ok {
+		conn = c.(net.Conn)
+	} else {
 		conn, err = t.dial(addr)
 		if err != nil {
 			return time.Time{}, fmt.Errorf("failed to create new packet connection: %v", err)
 		}
-		t.connPool[addr] = conn
+		t.connPool.Add(addr, conn)
 
 		// Signal that this is a packet connection.
 		conn.Write([]byte{'p', '\n'})
 
 		// TODO: This might only be the private, not the public address. We should
 		// probably send the advertise address down the wire.
-		conn.Write([]byte(t.tcpListeners[0].Addr().String()))
-		conn.Write([]byte{'\n'})
+		conn.Write(append([]byte(t.tcpListeners[0].Addr().String()), '\n'))
 	}
+
+	t.connPoolLock.Unlock()
 
 	// TODO: This is probably not performing very well. How about prefixing each msg
 	// with a length and reading just as far as the length?
-	msg := base64.StdEncoding.EncodeToString(b)
+	msg := []byte(base64.StdEncoding.EncodeToString(b))
+	msg = append(msg, '\n')
 
-	_, err = conn.Write([]byte(msg))
-	if err != nil {
-		t.logger.Println(err)
-		return time.Time{}, err
-	}
-
-	_, err = conn.Write([]byte{'\n'})
+	// This connection might be shared among multiple goroutines. conn.Write is
+	// thread safe. Make sure to write in one go so no concurrent write gets in
+	// between.
+	_, err = conn.Write(msg)
 	if err != nil {
 		t.logger.Println(err)
 		return time.Time{}, err
@@ -299,7 +314,7 @@ func (t *TLSTransport) Shutdown() error {
 }
 
 // tcpListen is a long running goroutine that accepts incoming TCP connections
-// and hands them off to the stream channel.
+// and hands them off to either the stream or packet channel.
 func (t *TLSTransport) tcpListen(ln net.Listener) {
 	defer t.wg.Done()
 	for {

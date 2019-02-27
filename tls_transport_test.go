@@ -113,7 +113,7 @@ func TestReusePacketTCPConnections(t *testing.T) {
 	}
 
 	numberTCPConnEstablished := metricFamilies[0].GetMetric()[0].GetCounter().GetValue()
-	require.Equal(t, float64(5), numberTCPConnEstablished, "unexpected amount of established connections")
+	require.Equal(t, float64(2), numberTCPConnEstablished, "unexpected amount of established connections")
 }
 
 type delegate struct {
