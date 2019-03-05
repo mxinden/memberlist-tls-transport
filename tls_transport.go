@@ -49,6 +49,7 @@ type TLSTransport struct {
 	shutdown     int32
 
 	tcpConnEstablished prometheus.Counter
+	tcpConnClosed      prometheus.Counter
 
 	// Don't use RWMutex. connPool.Get records the recent usage, hence
 	// concurrent Gets are not safe.
@@ -78,10 +79,13 @@ func NewTLSTransport(config *TLSTransportConfig, reg prometheus.Registerer) (*TL
 	}
 
 	t.connPool.OnEvicted = func(key lru.Key, conn interface{}) {
+		fmt.Printf("evicting connection: %v", key)
 		err := conn.(net.Conn).Close()
 		if err != nil {
 			log.Fatalf("failed to close tls connection triggered by lru cache evection: %v", err)
 		}
+
+		t.tcpConnClosed.Inc()
 	}
 
 	t.registerMetrics(reg)
@@ -136,13 +140,19 @@ func NewTLSTransport(config *TLSTransportConfig, reg prometheus.Registerer) (*TL
 	return &t, nil
 }
 
+// TODO: Rework metric descriptions.
 func (t *TLSTransport) registerMetrics(reg prometheus.Registerer) {
 	t.tcpConnEstablished = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "memberlist_tls_transport_tcp_conn_established",
 		Help: "Amount of tcp connections established for memberlist's tls transport layer.",
 	})
 
-	reg.MustRegister(t.tcpConnEstablished)
+	t.tcpConnClosed = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "memberlist_tls_transport_tcp_conn_closed",
+		Help: "Amount of memberlist's tls transport layer connections closed either through shutdown or connection pool eviction.",
+	})
+
+	reg.MustRegister(t.tcpConnEstablished, t.tcpConnClosed)
 }
 
 // GetAutoBindPort returns the bind port that was automatically given by the
@@ -236,6 +246,7 @@ func (t *TLSTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 
 	t.connPoolLock.Lock()
 
+	fmt.Println("Getting connection for: ", addr)
 	if c, ok := t.connPool.Get(addr); ok {
 		conn = c.(net.Conn)
 	} else {
@@ -243,8 +254,12 @@ func (t *TLSTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 		if err != nil {
 			return time.Time{}, fmt.Errorf("failed to create new packet connection: %v", err)
 		}
+		go t.readConn(addr, conn)
+		t.logger.Printf("Adding new connection for: %q\n", addr)
 		t.connPool.Add(addr, conn)
 
+		// TODO: We should send a magicbyte signaling the protocol and a version
+		// byte first before sending the connection type.
 		// Signal that this is a packet connection.
 		conn.Write([]byte{'p', '\n'})
 
@@ -306,6 +321,7 @@ func (t *TLSTransport) Shutdown() error {
 	// Rip through all the connections and shut them down.
 	for _, conn := range t.tcpListeners {
 		conn.Close()
+		t.tcpConnClosed.Inc()
 	}
 
 	// Block until all the listener threads have died.
@@ -313,12 +329,52 @@ func (t *TLSTransport) Shutdown() error {
 	return nil
 }
 
+func (t *TLSTransport) readConn(remoteAddr string, conn net.Conn) {
+	host, portString, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		t.logger.Fatal(err)
+	}
+
+	port, err := strconv.Atoi(portString)
+	if err != nil {
+		t.logger.Fatal(err)
+	}
+
+	addr := &net.TCPAddr{
+		IP:   net.ParseIP(host),
+		Port: port,
+	}
+	reader := bufio.NewReader(conn)
+
+	for {
+		msgB64, err := reader.ReadString('\n')
+		if err != nil {
+			t.logger.Fatalf("failed to read message from packet connection: %v", err)
+		}
+		ts := time.Now()
+
+		msgB64 = strings.Trim(msgB64, "\n")
+
+		msg, err := base64.StdEncoding.DecodeString(msgB64)
+		if err != nil {
+			t.logger.Fatalf("failed to base64 decode packet message: %v", err)
+		}
+
+		// TODO: Should we still increase these metrics?
+		// metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
+		t.packetCh <- &memberlist.Packet{
+			Buf:       []byte(msg),
+			From:      addr,
+			Timestamp: ts,
+		}
+	}
+}
+
 // tcpListen is a long running goroutine that accepts incoming TCP connections
 // and hands them off to either the stream or packet channel.
 func (t *TLSTransport) tcpListen(ln net.Listener) {
 	defer t.wg.Done()
 	for {
-		ts := time.Now()
 		conn, err := ln.Accept()
 		if err != nil {
 			if s := atomic.LoadInt32(&t.shutdown); s == 1 {
@@ -345,44 +401,14 @@ func (t *TLSTransport) tcpListen(ln net.Listener) {
 
 			remoteAddr = strings.Trim(remoteAddr, "\n")
 
-			host, portString, err := net.SplitHostPort(remoteAddr)
-			if err != nil {
-				t.logger.Fatal(err)
-			}
+			go t.readConn(remoteAddr, conn)
 
-			port, err := strconv.Atoi(portString)
-			if err != nil {
-				t.logger.Fatal(err)
-			}
-
-			addr := &net.TCPAddr{
-				IP:   net.ParseIP(host),
-				Port: port,
-			}
-
-			go func() {
-				for {
-					msgB64, err := reader.ReadString('\n')
-					if err != nil {
-						t.logger.Fatalf("failed to read message from packet connection: %v", err)
-					}
-					msgB64 = strings.Trim(msgB64, "\n")
-
-					msg, err := base64.StdEncoding.DecodeString(msgB64)
-					if err != nil {
-						t.logger.Fatalf("failed to base64 decode packet message: %v", err)
-					}
-
-					// TODO: Should we still increase these metrics?
-					// metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
-					t.packetCh <- &memberlist.Packet{
-						Buf:       []byte(msg),
-						From:      addr,
-						Timestamp: ts,
-					}
-				}
-			}()
-
+			t.connPoolLock.Lock()
+			t.logger.Printf("Adding connection for: %q\n", remoteAddr)
+			// TODO: Check if the connection already exists, if so, the callback
+			// is not called when overwriting the value.
+			t.connPool.Add(remoteAddr, conn)
+			t.connPoolLock.Unlock()
 		} else {
 			t.streamCh <- conn
 		}
