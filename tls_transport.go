@@ -11,16 +11,15 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	// "github.com/armon/go-metrics"
-	"github.com/golang/groupcache/lru"
 	sockaddr "github.com/hashicorp/go-sockaddr"
 	"github.com/hashicorp/memberlist"
+	"github.com/mxinden/memberlist-tls-transport/internal"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -48,13 +47,7 @@ type TLSTransport struct {
 	tcpListeners []net.Listener
 	shutdown     int32
 
-	tcpConnEstablished prometheus.Counter
-	tcpConnClosed      prometheus.Counter
-
-	// Don't use RWMutex. connPool.Get records the recent usage, hence
-	// concurrent Gets are not safe.
-	connPoolLock sync.Mutex
-	connPool     *lru.Cache
+	connPool *internal.ConnPool
 }
 
 // NewTLSTransport returns a net transport with the given configuration. On
@@ -73,22 +66,7 @@ func NewTLSTransport(config *TLSTransportConfig, reg prometheus.Registerer) (*TL
 		packetCh: make(chan *memberlist.Packet),
 		streamCh: make(chan net.Conn),
 		logger:   config.Logger,
-		// TODO: How about using the current instance count here instead? Should
-		// probably be a safe default.
-		connPool: lru.New(5),
 	}
-
-	t.connPool.OnEvicted = func(key lru.Key, conn interface{}) {
-		fmt.Printf("evicting connection: %v", key)
-		err := conn.(net.Conn).Close()
-		if err != nil {
-			log.Fatalf("failed to close tls connection triggered by lru cache evection: %v", err)
-		}
-
-		t.tcpConnClosed.Inc()
-	}
-
-	t.registerMetrics(reg)
 
 	// Clean up listeners if there's an error.
 	defer func() {
@@ -136,23 +114,10 @@ func NewTLSTransport(config *TLSTransportConfig, reg prometheus.Registerer) (*TL
 		go t.tcpListen(t.tcpListeners[i])
 	}
 
+	t.connPool = internal.NewConnPool(t.packetCh, reg, t.logger, t.tcpListeners[0].Addr().String())
+
 	ok = true
 	return &t, nil
-}
-
-// TODO: Rework metric descriptions.
-func (t *TLSTransport) registerMetrics(reg prometheus.Registerer) {
-	t.tcpConnEstablished = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "memberlist_tls_transport_tcp_conn_established",
-		Help: "Amount of tcp connections established for memberlist's tls transport layer.",
-	})
-
-	t.tcpConnClosed = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "memberlist_tls_transport_tcp_conn_closed",
-		Help: "Amount of memberlist's tls transport layer connections closed either through shutdown or connection pool eviction.",
-	})
-
-	reg.MustRegister(t.tcpConnEstablished, t.tcpConnClosed)
 }
 
 // GetAutoBindPort returns the bind port that was automatically given by the
@@ -209,66 +174,33 @@ func (t *TLSTransport) FinalAdvertiseAddr(ip string, port int) (net.IP, int, err
 	return advertiseAddr, advertisePort, nil
 }
 
-func (t *TLSTransport) dial(addr string) (net.Conn, error) {
-	cert, err := tls.LoadX509KeyPair("./certs/client.pem", "./certs/client-key.pem")
-
-	caCert, err := ioutil.ReadFile("./certs/ca.pem")
-	if err != nil {
-		log.Fatalf("failed to load cert: %s", err)
-	}
-
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert}, // this certificate is used to sign the handshake
-		RootCAs:      caCertPool,              // this is used to validate the server certificate
-	}
-	tlsConfig.BuildNameToCertificate()
-
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
-	if err != nil {
-		t.logger.Println(err)
-		return nil, err
-	}
-
-	t.tcpConnEstablished.Inc()
-
-	return conn, nil
-}
-
 // See Transport.
 func (t *TLSTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 	var (
 		conn net.Conn
 		err  error
+		ok   bool
 	)
 
-	t.connPoolLock.Lock()
+	t.logger.Printf("Sending msg to %v", addr)
 
-	fmt.Println("Getting connection for: ", addr)
-	if c, ok := t.connPool.Get(addr); ok {
-		conn = c.(net.Conn)
-	} else {
+	conn, ok = t.connPool.Get(addr)
+
+	if !ok {
+		fmt.Println("Cache miss")
 		conn, err = t.dial(addr)
 		if err != nil {
 			return time.Time{}, fmt.Errorf("failed to create new packet connection: %v", err)
 		}
-		go t.readConn(addr, conn)
-		t.logger.Printf("Adding new connection for: %q\n", addr)
-		t.connPool.Add(addr, conn)
 
 		// TODO: We should send a magicbyte signaling the protocol and a version
 		// byte first before sending the connection type.
 		// Signal that this is a packet connection.
 		conn.Write([]byte{'p', '\n'})
-
 		// TODO: This might only be the private, not the public address. We should
 		// probably send the advertise address down the wire.
 		conn.Write(append([]byte(t.tcpListeners[0].Addr().String()), '\n'))
 	}
-
-	t.connPoolLock.Unlock()
 
 	// TODO: This is probably not performing very well. How about prefixing each msg
 	// with a length and reading just as far as the length?
@@ -282,6 +214,10 @@ func (t *TLSTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 	if err != nil {
 		t.logger.Println(err)
 		return time.Time{}, err
+	}
+
+	if !ok {
+		t.connPool.AddAndRead(addr, conn)
 	}
 
 	return time.Now(), nil
@@ -319,55 +255,41 @@ func (t *TLSTransport) Shutdown() error {
 	atomic.StoreInt32(&t.shutdown, 1)
 
 	// Rip through all the connections and shut them down.
-	for _, conn := range t.tcpListeners {
-		conn.Close()
-		t.tcpConnClosed.Inc()
+	for _, listener := range t.tcpListeners {
+		listener.Close()
 	}
 
 	// Block until all the listener threads have died.
 	t.wg.Wait()
+
+	t.connPool.Shutdown()
 	return nil
 }
 
-func (t *TLSTransport) readConn(remoteAddr string, conn net.Conn) {
-	host, portString, err := net.SplitHostPort(remoteAddr)
+func (t *TLSTransport) dial(addr string) (net.Conn, error) {
+	cert, err := tls.LoadX509KeyPair("./certs/client.pem", "./certs/client-key.pem")
+
+	caCert, err := ioutil.ReadFile("./certs/ca.pem")
 	if err != nil {
-		t.logger.Fatal(err)
+		log.Fatalf("failed to load cert: %s", err)
 	}
 
-	port, err := strconv.Atoi(portString)
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert}, // this certificate is used to sign the handshake
+		RootCAs:      caCertPool,              // this is used to validate the server certificate
+	}
+	tlsConfig.BuildNameToCertificate()
+
+	conn, err := tls.Dial("tcp", addr, tlsConfig)
 	if err != nil {
-		t.logger.Fatal(err)
+		t.logger.Println(err)
+		return nil, err
 	}
 
-	addr := &net.TCPAddr{
-		IP:   net.ParseIP(host),
-		Port: port,
-	}
-	reader := bufio.NewReader(conn)
-
-	for {
-		msgB64, err := reader.ReadString('\n')
-		if err != nil {
-			t.logger.Fatalf("failed to read message from packet connection: %v", err)
-		}
-		ts := time.Now()
-
-		msgB64 = strings.Trim(msgB64, "\n")
-
-		msg, err := base64.StdEncoding.DecodeString(msgB64)
-		if err != nil {
-			t.logger.Fatalf("failed to base64 decode packet message: %v", err)
-		}
-
-		// TODO: Should we still increase these metrics?
-		// metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
-		t.packetCh <- &memberlist.Packet{
-			Buf:       []byte(msg),
-			From:      addr,
-			Timestamp: ts,
-		}
-	}
+	return conn, nil
 }
 
 // tcpListen is a long running goroutine that accepts incoming TCP connections
@@ -401,14 +323,9 @@ func (t *TLSTransport) tcpListen(ln net.Listener) {
 
 			remoteAddr = strings.Trim(remoteAddr, "\n")
 
-			go t.readConn(remoteAddr, conn)
-
-			t.connPoolLock.Lock()
-			t.logger.Printf("Adding connection for: %q\n", remoteAddr)
-			// TODO: Check if the connection already exists, if so, the callback
-			// is not called when overwriting the value.
-			t.connPool.Add(remoteAddr, conn)
-			t.connPoolLock.Unlock()
+			if err := t.connPool.AddAndRead(remoteAddr, conn); err != nil {
+				t.logger.Fatalf("failed to add connection to pool: %v", err)
+			}
 		} else {
 			t.streamCh <- conn
 		}

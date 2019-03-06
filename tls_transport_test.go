@@ -34,6 +34,8 @@ func TestJoin(t *testing.T) {
 		panic("failed to join cluster")
 	}
 
+	time.Sleep(time.Second)
+
 	_, err = list2.Join([]string{list1.LocalNode().Address()})
 	if err != nil {
 		panic("failed to join cluster")
@@ -83,7 +85,7 @@ func TestReusePacketTCPConnections(t *testing.T) {
 		panic("failed to join cluster")
 	}
 
-	time.Sleep(time.Second)
+	time.Sleep(2 * time.Second)
 
 	_, err = list2.Join([]string{list1.LocalNode().Address()})
 	if err != nil {
@@ -125,7 +127,7 @@ func TestReusePacketTCPConnections(t *testing.T) {
 	}
 
 	numberTCPConnEstablished := metricFamilies[1].GetMetric()[0].GetCounter().GetValue()
-	require.Equal(t, float64(2), numberTCPConnEstablished, "unexpected amount of established connections")
+	require.Equal(t, float64(1), numberTCPConnEstablished, "unexpected amount of established connections")
 }
 
 type delegate struct {
@@ -268,7 +270,7 @@ func createMemberlist(id string, d memberlist.Delegate, reg prometheus.Registere
 	}
 
 	conf.BindAddr = "127.0.0.1"
-	conf.Logger = log.New(os.Stderr, id, log.LstdFlags)
+	conf.Logger = log.New(os.Stderr, id+": ", log.LstdFlags)
 
 	nc := TLSTransportConfig{
 		BindAddrs: []string{conf.BindAddr},
