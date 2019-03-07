@@ -15,6 +15,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// packetConn is a package internal helper struct, wrapping a net.Conn and
+// listening for incoming packets on the connection.
 type packetConn struct {
 	conn       net.Conn
 	done       chan struct{}
@@ -65,7 +67,7 @@ func newPacketConn(
 // We need to wait for any new incoming packets before closing.
 func (c *packetConn) CloseInABit() {
 	go func() {
-		time.Sleep(time.Minute)
+		time.Sleep(10 * time.Second)
 		close(c.done)
 		c.conn.Close()
 	}()
@@ -118,12 +120,12 @@ func (c *packetConn) read() {
 	}
 }
 
-type ConnPool struct {
+// PacketConnPool caches multiple packet connections in a least-recently-used
+// cache. In addition any connection added to the pool is also being read for
+// incoming packets.
+type PacketConnPool struct {
 	// Don't use RWMutex. connPool.Get records the recent usage, hence
 	// concurrent Gets are not safe.
-	//
-	// TODO: Maybe this should be called packetConnPool, as it does not contain
-	// stream connections.
 	lock     sync.Mutex
 	pool     *lru.Cache
 	packetCh chan<- *memberlist.Packet
@@ -136,15 +138,16 @@ type ConnPool struct {
 	connRemovedFromPool prometheus.Counter
 }
 
-func NewConnPool(
+// NewPacketConnPool instantiates a new packet connection pool.
+func NewPacketConnPool(
 	packetCh chan<- *memberlist.Packet,
 	reg prometheus.Registerer,
 	log *log.Logger,
 	localAddr string,
-) *ConnPool {
+) *PacketConnPool {
 	closing := make(chan string)
 
-	p := &ConnPool{
+	p := &PacketConnPool{
 		pool:      lru.New(5),
 		closing:   closing,
 		packetCh:  packetCh,
@@ -165,7 +168,7 @@ func NewConnPool(
 }
 
 // TODO: Rework metric descriptions.
-func (p *ConnPool) registerMetrics(reg prometheus.Registerer) {
+func (p *PacketConnPool) registerMetrics(reg prometheus.Registerer) {
 	p.connAddedToPool = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "memberlist_tls_transport_conn_added_to_pool",
 		Help: "Amount of connections added to connection pool.",
@@ -181,7 +184,7 @@ func (p *ConnPool) registerMetrics(reg prometheus.Registerer) {
 
 // AddAndRead adds a connection to the pool and start reading for incoming
 // packages.
-func (p *ConnPool) AddAndRead(remoteAddr string, conn net.Conn, incoming bool) error {
+func (p *PacketConnPool) AddAndRead(remoteAddr string, conn net.Conn, incoming bool) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -241,7 +244,8 @@ func (p *ConnPool) AddAndRead(remoteAddr string, conn net.Conn, incoming bool) e
 	return nil
 }
 
-func (p *ConnPool) Get(addr string) (net.Conn, bool) {
+// Get returns a connection to the given address or returns false.
+func (p *PacketConnPool) Get(addr string) (net.Conn, bool) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -252,7 +256,7 @@ func (p *ConnPool) Get(addr string) (net.Conn, bool) {
 	return conn.(*packetConn).conn, ok
 }
 
-func (p *ConnPool) gc() {
+func (p *PacketConnPool) gc() {
 	for {
 		addr := <-p.closing
 
@@ -263,6 +267,7 @@ func (p *ConnPool) gc() {
 	}
 }
 
-func (p *ConnPool) Shutdown() {
+// Shutdown closes and removes all connections from the pool.
+func (p *PacketConnPool) Shutdown() {
 	p.pool.Clear()
 }

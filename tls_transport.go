@@ -47,7 +47,7 @@ type TLSTransport struct {
 	tcpListeners []net.Listener
 	shutdown     int32
 
-	connPool *internal.ConnPool
+	connPool *internal.PacketConnPool
 
 	connEstablished prometheus.Counter
 }
@@ -118,7 +118,7 @@ func NewTLSTransport(config *TLSTransportConfig, reg prometheus.Registerer) (*TL
 		go t.tcpListen(t.tcpListeners[i])
 	}
 
-	t.connPool = internal.NewConnPool(t.packetCh, reg, t.logger, t.tcpListeners[0].Addr().String())
+	t.connPool = internal.NewPacketConnPool(t.packetCh, reg, t.logger, t.tcpListeners[0].Addr().String())
 
 	ok = true
 	return &t, nil
