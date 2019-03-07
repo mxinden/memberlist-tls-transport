@@ -1,9 +1,13 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,107 +19,17 @@ import (
 )
 
 func TestJoin(t *testing.T) {
-	registry1 := prometheus.NewRegistry()
-	defer printMetricOnTestFailure(t, registry1)
-	list1, err := createMemberlist("1", nil, registry1)
-	if err != nil {
-		panic("failed to create memberlist")
-	}
+	_, cleanupFunc := createTwoMemberCluster(t)
 
-	registry2 := prometheus.NewRegistry()
-	defer printMetricOnTestFailure(t, registry2)
-	list2, err := createMemberlist("2", nil, registry2)
-	if err != nil {
-		panic("failed to create memberlist")
-	}
-
-	_, err = list1.Join([]string{list2.LocalNode().Address()})
-	if err != nil {
-		panic("failed to join cluster")
-	}
-
-	time.Sleep(time.Second)
-
-	_, err = list2.Join([]string{list1.LocalNode().Address()})
-	if err != nil {
-		panic("failed to join cluster")
-	}
-
-	time.Sleep(2 * time.Second)
-
-	if len(list1.Members()) != 2 || len(list2.Members()) != 2 {
-		t.Errorf("expected each memberlist to have 2 members but got %v and %v instead", len(list1.Members()), len(list2.Members()))
-
-		t.Error("List 1:")
-		for _, m := range list1.Members() {
-			t.Errorf("Member: %s %s\n", m.Name, m.Addr)
-		}
-
-		t.Error("List 2:")
-		for _, m := range list2.Members() {
-			t.Errorf("Member: %s %s\n", m.Name, m.Addr)
-		}
-	}
-
-	err = list1.Shutdown()
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = list2.Shutdown()
-	if err != nil {
-		t.Fatal(err)
-	}
+	defer cleanupFunc()
 }
 
 func TestReusePacketTCPConnections(t *testing.T) {
-	list1Registry := prometheus.NewRegistry()
-	defer printMetricOnTestFailure(t, list1Registry)
-	list1, err := createMemberlist("1", nil, list1Registry)
-	if err != nil {
-		panic("failed to create memberlist")
-	}
+	cluster, cleanupFunc := createTwoMemberCluster(t)
 
-	list2, err := createMemberlist("2", nil, prometheus.NewRegistry())
-	if err != nil {
-		panic("failed to create memberlist")
-	}
+	defer cleanupFunc()
 
-	_, err = list1.Join([]string{list2.LocalNode().Address()})
-	if err != nil {
-		panic("failed to join cluster")
-	}
-
-	_, err = list2.Join([]string{list1.LocalNode().Address()})
-	if err != nil {
-		panic("failed to join cluster")
-	}
-
-	time.Sleep(1 * time.Second)
-
-	if len(list1.Members()) != 2 || len(list2.Members()) != 2 {
-		t.Errorf("expected each memberlist to have 2 members but got %v and %v instead", len(list1.Members()), len(list2.Members()))
-
-		t.Error("List 1:")
-		for _, m := range list1.Members() {
-			t.Errorf("Member: %s %s\n", m.Name, m.Addr)
-		}
-
-		t.Error("List 2:")
-		for _, m := range list2.Members() {
-			t.Errorf("Member: %s %s\n", m.Name, m.Addr)
-		}
-	}
-
-	err = list1.Shutdown()
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = list2.Shutdown()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	metricFamilies, err := list1Registry.Gather()
+	metricFamilies, err := cluster.registries[1].Gather()
 	if err != nil {
 		t.Fatalf("failed to get metric families: %v", err)
 	}
@@ -159,94 +73,42 @@ func (d *delegate) MergeRemoteState(buf []byte, join bool) {
 }
 
 func TestSendBestEffort(t *testing.T) {
+	cluster, cleanupFunc := createTwoMemberCluster(t)
+
+	defer cleanupFunc()
+
 	msg := "test123"
-	delegate1 := delegate{}
-	list1, err := createMemberlist("1", &delegate1, prometheus.NewRegistry())
-	if err != nil {
-		panic("failed to create memberlist")
-	}
-
-	delegate2 := delegate{}
-	list2, err := createMemberlist("2", &delegate2, prometheus.NewRegistry())
-	if err != nil {
-		panic("failed to create memberlist")
-	}
-
-	_, err = list1.Join([]string{list2.LocalNode().Address()})
-	if err != nil {
-		panic("failed to join cluster")
-	}
-
-	_, err = list2.Join([]string{list1.LocalNode().Address()})
-	if err != nil {
-		panic("failed to join cluster")
-	}
 
 	// TODO: Make sure we are not sending to ourself
-	err = list1.SendBestEffort(list2.Members()[1], []byte(msg))
+	err := cluster.members[0].SendBestEffort(cluster.members[1].Members()[1], []byte(msg))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(time.Second)
 
-	if len(delegate2.Msgs) != 1 {
-		t.Fatalf("expected delegate2 to have one messsage but got: %v", len(delegate2.Msgs))
-	}
-
-	err = list1.Shutdown()
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = list2.Shutdown()
-	if err != nil {
-		t.Fatal(err)
+	if len(cluster.delegates[1].Msgs) != 1 {
+		t.Fatalf("expected delegate2 to have one messsage but got: %v", len(cluster.delegates[1].Msgs))
 	}
 }
 
 func TestSendReliable(t *testing.T) {
+	cluster, cleanupFunc := createTwoMemberCluster(t)
+
+	defer cleanupFunc()
+
 	msg := "test123"
-	delegate1 := delegate{}
-	list1, err := createMemberlist("1", &delegate1, prometheus.NewRegistry())
-	if err != nil {
-		panic("failed to create memberlist")
-	}
-
-	delegate2 := delegate{}
-	list2, err := createMemberlist("2", &delegate2, prometheus.NewRegistry())
-	if err != nil {
-		panic("failed to create memberlist")
-	}
-
-	_, err = list1.Join([]string{list2.LocalNode().Address()})
-	if err != nil {
-		panic("failed to join cluster")
-	}
-
-	_, err = list2.Join([]string{list1.LocalNode().Address()})
-	if err != nil {
-		panic("failed to join cluster")
-	}
 
 	// TODO: Make sure we are not sending to ourself
-	err = list1.SendReliable(list2.Members()[1], []byte(msg))
+	err := cluster.members[0].SendReliable(cluster.members[1].Members()[1], []byte(msg))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	time.Sleep(time.Second)
 
-	if len(delegate2.Msgs) != 1 {
-		t.Fatalf("expected delegate2 to have one messsage but got: %v", len(delegate2.Msgs))
-	}
-
-	err = list1.Shutdown()
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = list2.Shutdown()
-	if err != nil {
-		t.Fatal(err)
+	if len(cluster.delegates[1].Msgs) != 1 {
+		t.Fatalf("expected delegate2 to have one messsage but got: %v", len(cluster.delegates[1].Msgs))
 	}
 }
 
@@ -265,7 +127,84 @@ func TestRegistersMetrics(t *testing.T) {
 	require.Equal(t, 3, len(families), "unexpected length of metric families")
 }
 
+type twoMemberCluster struct {
+	registries [2]*prometheus.Registry
+	members    [2]*memberlist.Memberlist
+	delegates  [2]*delegate
+}
+
+func createTwoMemberCluster(t *testing.T) (*twoMemberCluster, func()) {
+	var err error
+
+	c := &twoMemberCluster{
+		registries: [2]*prometheus.Registry{},
+		members:    [2]*memberlist.Memberlist{},
+		delegates:  [2]*delegate{},
+	}
+
+	for i := 0; i < 2; i++ {
+		c.registries[i] = prometheus.NewRegistry()
+
+		c.delegates[i] = &delegate{}
+
+		c.members[i], err = createMemberlist(strconv.Itoa(i), c.delegates[i], c.registries[i])
+		if err != nil {
+			t.Fatalf("failed to create memberlist %v: %v", i, err)
+		}
+	}
+
+	for i := 0; i < 2; i++ {
+		_, err = c.members[i].Join([]string{c.members[(i+1)%2].LocalNode().Address()})
+		if err != nil {
+			panic("failed to join cluster")
+		}
+	}
+
+	time.Sleep(time.Second)
+
+	for i := 0; i < 2; i++ {
+		if len(c.members[i].Members()) != 2 {
+			t.Errorf("expected memberlist to have 2 members but got %v instead", len(c.members[i].Members()))
+		}
+	}
+
+	cleanupFunc := func() {
+		for i := 0; i < 2; i++ {
+			err = c.members[i].Shutdown()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	return c, cleanupFunc
+}
+
 func createMemberlist(id string, d memberlist.Delegate, reg prometheus.Registerer) (*memberlist.Memberlist, error) {
+	nodeName := "node" + id
+
+	// Generated via https://github.com/wolfeidau/golang-massl
+	caCert, err := ioutil.ReadFile("./certs/ca.pem")
+	if err != nil {
+		log.Fatalf("failed to load cert: %s", err)
+	}
+
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	cert, err := tls.LoadX509KeyPair("./certs/"+nodeName+".pem", "./certs/"+nodeName+"-key.pem")
+	if err != nil {
+		return nil, fmt.Errorf("%v", err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},        // server certificate which is validated by the client
+		ClientCAs:    caCertPool,                     // used to verify the client cert is signed by the CA and is therefore valid
+		ClientAuth:   tls.RequireAndVerifyClientCert, // this requires a valid client certificate to be supplied during handshake
+		RootCAs:      caCertPool,                     // this is used to validate the server certificate
+	}
+	tlsConfig.BuildNameToCertificate()
+
 	conf := memberlist.DefaultLocalConfig()
 	// Let OS choose port so parallel unit tests don't conflict.
 	conf.BindPort = 0
@@ -282,6 +221,7 @@ func createMemberlist(id string, d memberlist.Delegate, reg prometheus.Registere
 		BindPort:  conf.BindPort,
 		// TODO: insert proper logger.
 		Logger: conf.Logger,
+		TLS:    tlsConfig,
 	}
 
 	// See comment below for details about the retry in here.

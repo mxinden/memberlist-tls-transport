@@ -5,10 +5,8 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"strings"
@@ -34,6 +32,8 @@ type TLSTransportConfig struct {
 
 	// Logger is a logger for operator messages.
 	Logger *log.Logger
+
+	TLS *tls.Config
 }
 
 // TLSTransport is a Transport implementation that uses connectionless UDP for
@@ -84,28 +84,8 @@ func NewTLSTransport(config *TLSTransportConfig, reg prometheus.Registerer) (*TL
 	for _, addr := range config.BindAddrs {
 		ip := net.ParseIP(addr)
 
-		// Generated via https://github.com/wolfeidau/golang-massl
-		caCert, err := ioutil.ReadFile("./certs/ca.pem")
-		if err != nil {
-			log.Fatalf("failed to load cert: %s", err)
-		}
-
-		caCertPool := x509.NewCertPool()
-		caCertPool.AppendCertsFromPEM(caCert)
-
-		cert, err := tls.LoadX509KeyPair("./certs/server.pem", "./certs/server-key.pem")
-		if err != nil {
-			return nil, fmt.Errorf("%v", err)
-		}
-
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},        // server certificate which is validated by the client
-			ClientCAs:    caCertPool,                     // used to verify the client cert is signed by the CA and is therefore valid
-			ClientAuth:   tls.RequireAndVerifyClientCert, // this requires a valid client certificate to be supplied during handshake
-		}
-
 		tcpAddr := &net.TCPAddr{IP: ip, Port: port}
-		tcpLn, err := tls.Listen("tcp", tcpAddr.String(), tlsConfig)
+		tcpLn, err := tls.Listen("tcp", tcpAddr.String(), t.config.TLS)
 		if err != nil {
 			return nil, fmt.Errorf("Failed to start TLS listener on %q port %d: %v", addr, port, err)
 		}
@@ -277,23 +257,7 @@ func (t *TLSTransport) Shutdown() error {
 }
 
 func (t *TLSTransport) dial(addr string) (net.Conn, error) {
-	cert, err := tls.LoadX509KeyPair("./certs/client.pem", "./certs/client-key.pem")
-
-	caCert, err := ioutil.ReadFile("./certs/ca.pem")
-	if err != nil {
-		log.Fatalf("failed to load cert: %s", err)
-	}
-
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert}, // this certificate is used to sign the handshake
-		RootCAs:      caCertPool,              // this is used to validate the server certificate
-	}
-	tlsConfig.BuildNameToCertificate()
-
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
+	conn, err := tls.Dial("tcp", addr, t.config.TLS)
 	if err != nil {
 		t.logger.Println(err)
 		return nil, err
