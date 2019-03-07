@@ -15,8 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// TODO: Should this be a packet connection?
-type Conn struct {
+type packetConn struct {
 	conn       net.Conn
 	done       chan struct{}
 	closing    chan<- string
@@ -26,14 +25,14 @@ type Conn struct {
 	incoming   bool
 }
 
-func NewConn(
+func newPacketConn(
 	remoteAddr string,
 	c net.Conn,
 	packetCh chan<- *memberlist.Packet,
 	closing chan<- string,
 	logger *log.Logger,
 	incoming bool,
-) (*Conn, error) {
+) (*packetConn, error) {
 	host, portString, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
 		return nil, err
@@ -48,7 +47,7 @@ func NewConn(
 		IP:   net.ParseIP(host),
 		Port: port,
 	}
-	conn := &Conn{
+	conn := &packetConn{
 		conn:       c,
 		remoteAddr: addr,
 		packetCh:   packetCh,
@@ -64,7 +63,7 @@ func NewConn(
 }
 
 // We need to wait for any new incoming packets before closing.
-func (c *Conn) CloseInABit() {
+func (c *packetConn) CloseInABit() {
 	go func() {
 		time.Sleep(time.Minute)
 		close(c.done)
@@ -74,15 +73,15 @@ func (c *Conn) CloseInABit() {
 
 // Incoming returns whether the connection is an incoming or an outgoing TCP
 // connection.
-func (c *Conn) IsIncoming() bool {
+func (c *packetConn) IsIncoming() bool {
 	return c.incoming
 }
 
-func (c *Conn) close() {
+func (c *packetConn) close() {
 	c.closing <- c.remoteAddr.String()
 }
 
-func (c *Conn) read() {
+func (c *packetConn) read() {
 	reader := bufio.NewReader(c.conn)
 
 	for {
@@ -154,7 +153,7 @@ func NewConnPool(
 	}
 
 	p.pool.OnEvicted = func(key lru.Key, conn interface{}) {
-		conn.(*Conn).CloseInABit()
+		conn.(*packetConn).CloseInABit()
 		p.logger.Printf("going to remove connection from pool")
 
 		p.connRemovedFromPool.Inc()
@@ -186,7 +185,7 @@ func (p *ConnPool) AddAndRead(remoteAddr string, conn net.Conn, incoming bool) e
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	newConn, err := NewConn(
+	newConn, err := newPacketConn(
 		remoteAddr,
 		conn,
 		p.packetCh,
@@ -207,7 +206,7 @@ func (p *ConnPool) AddAndRead(remoteAddr string, conn net.Conn, incoming bool) e
 		return nil
 	}
 
-	if newConn.IsIncoming() == oldConn.(*Conn).IsIncoming() {
+	if newConn.IsIncoming() == oldConn.(*packetConn).IsIncoming() {
 		// Both are incoming or outgoing, closing new one.
 		newConn.CloseInABit()
 		return nil
@@ -250,7 +249,7 @@ func (p *ConnPool) Get(addr string) (net.Conn, bool) {
 	if !ok {
 		return nil, ok
 	}
-	return conn.(*Conn).conn, ok
+	return conn.(*packetConn).conn, ok
 }
 
 func (p *ConnPool) gc() {
