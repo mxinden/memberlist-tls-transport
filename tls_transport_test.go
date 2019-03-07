@@ -85,18 +85,12 @@ func TestReusePacketTCPConnections(t *testing.T) {
 		panic("failed to join cluster")
 	}
 
-	time.Sleep(2 * time.Second)
-
 	_, err = list2.Join([]string{list1.LocalNode().Address()})
 	if err != nil {
 		panic("failed to join cluster")
 	}
 
-	fmt.Println(1)
-
-	time.Sleep(10 * time.Second)
-
-	fmt.Println(2)
+	time.Sleep(1 * time.Second)
 
 	if len(list1.Members()) != 2 || len(list2.Members()) != 2 {
 		t.Errorf("expected each memberlist to have 2 members but got %v and %v instead", len(list1.Members()), len(list2.Members()))
@@ -126,8 +120,19 @@ func TestReusePacketTCPConnections(t *testing.T) {
 		t.Fatalf("failed to get metric families: %v", err)
 	}
 
-	numberTCPConnEstablished := metricFamilies[1].GetMetric()[0].GetCounter().GetValue()
-	require.Equal(t, float64(1), numberTCPConnEstablished, "unexpected amount of established connections")
+	for _, f := range metricFamilies {
+		if *f.Name == "memberlist_tls_transport_conn_established" {
+			require.Equal(
+				t,
+				float64(2),
+				f.GetMetric()[0].GetCounter().GetValue(),
+				"unexpected amount of established connections",
+			)
+			return
+		}
+	}
+
+	t.Fatal("could not find metric")
 }
 
 type delegate struct {
@@ -257,7 +262,7 @@ func TestRegistersMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	require.Equal(t, 2, len(families), "unexpected length of metric families")
+	require.Equal(t, 3, len(families), "unexpected length of metric families")
 }
 
 func createMemberlist(id string, d memberlist.Delegate, reg prometheus.Registerer) (*memberlist.Memberlist, error) {

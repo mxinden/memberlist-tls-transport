@@ -23,6 +23,7 @@ type Conn struct {
 	packetCh   chan<- *memberlist.Packet
 	remoteAddr *net.TCPAddr
 	logger     *log.Logger
+	incoming   bool
 }
 
 func NewConn(
@@ -31,6 +32,7 @@ func NewConn(
 	packetCh chan<- *memberlist.Packet,
 	closing chan<- string,
 	logger *log.Logger,
+	incoming bool,
 ) (*Conn, error) {
 	host, portString, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
@@ -53,6 +55,7 @@ func NewConn(
 		closing:    closing,
 		done:       make(chan struct{}),
 		logger:     logger,
+		incoming:   incoming,
 	}
 
 	go conn.read()
@@ -69,6 +72,12 @@ func (c *Conn) CloseInABit() {
 	}()
 }
 
+// Incoming returns whether the connection is an incoming or an outgoing TCP
+// connection.
+func (c *Conn) IsIncoming() bool {
+	return c.incoming
+}
+
 func (c *Conn) close() {
 	c.closing <- c.remoteAddr.String()
 }
@@ -82,8 +91,6 @@ func (c *Conn) read() {
 			return
 		default:
 		}
-
-		c.logger.Println("reading ...")
 
 		msgB64, err := reader.ReadString('\n')
 		if err != nil {
@@ -101,8 +108,6 @@ func (c *Conn) read() {
 			c.close()
 			return
 		}
-
-		c.logger.Printf("Got msg from %v", c.remoteAddr)
 
 		// TODO: Should we still increase these metrics?
 		// metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
@@ -175,39 +180,65 @@ func (p *ConnPool) registerMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(p.connAddedToPool, p.connRemovedFromPool)
 }
 
-// Add connection to pool and start reading for incoming packages.
-// TODO: Check if the connection already exists, if so, the callback
-// is not called when overwriting the value.
-//
-// TODO: If two instances instantiate a connection to each other at the same
-// time, both of them might close the incoming connection at the same time,
-// resulting in both of them being closed.
-func (p *ConnPool) AddAndRead(remoteAddr string, conn net.Conn) error {
+// AddAndRead adds a connection to the pool and start reading for incoming
+// packages.
+func (p *ConnPool) AddAndRead(remoteAddr string, conn net.Conn, incoming bool) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
-	newConn, err := NewConn(remoteAddr, conn, p.packetCh, p.closing, p.logger)
+	newConn, err := NewConn(
+		remoteAddr,
+		conn,
+		p.packetCh,
+		p.closing,
+		p.logger,
+		incoming,
+	)
 	if err != nil {
 		return err
 	}
 
-	if _, ok := p.pool.Get(remoteAddr); ok {
-		p.logger.Println("duplicate connection")
-		if p.localAddr < remoteAddr {
-			p.logger.Printf("closing new one: %v -> %v", p.localAddr, remoteAddr)
+	oldConn, oldExists := p.pool.Get(remoteAddr)
+
+	if !oldExists {
+		// No connection so far, adding new one.
+		p.pool.Add(remoteAddr, newConn)
+		p.connAddedToPool.Inc()
+		return nil
+	}
+
+	if newConn.IsIncoming() == oldConn.(*Conn).IsIncoming() {
+		// Both are incoming or outgoing, closing new one.
+		newConn.CloseInABit()
+		return nil
+	}
+
+	// If both A and B instantiate a connection at the same time, have A close
+	// its incoming connection and B close its outgoing connection.
+	if p.localAddr < remoteAddr {
+		if newConn.IsIncoming() {
+			// A: closing incoming new connection.
 			newConn.CloseInABit()
 			return nil
 		}
 
-		p.logger.Printf("closing old one: %v -> %v", p.localAddr, remoteAddr)
+		// A: closing incoming old connection.
 		p.pool.Remove(remoteAddr)
+		p.pool.Add(remoteAddr, newConn)
+		p.connAddedToPool.Inc()
+		return nil
 	}
 
-	p.logger.Printf("Adding connection for %v", remoteAddr)
-	p.pool.Add(remoteAddr, newConn)
+	if newConn.IsIncoming() {
+		// B: closing outgoing old connection.
+		p.pool.Remove(remoteAddr)
+		p.pool.Add(remoteAddr, newConn)
+		p.connAddedToPool.Inc()
+		return nil
+	}
 
-	p.connAddedToPool.Inc()
-
+	// B: closing outgoing new connection.
+	newConn.CloseInABit()
 	return nil
 }
 

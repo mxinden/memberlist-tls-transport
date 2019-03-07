@@ -48,6 +48,8 @@ type TLSTransport struct {
 	shutdown     int32
 
 	connPool *internal.ConnPool
+
+	connEstablished prometheus.Counter
 }
 
 // NewTLSTransport returns a net transport with the given configuration. On
@@ -67,6 +69,8 @@ func NewTLSTransport(config *TLSTransportConfig, reg prometheus.Registerer) (*TL
 		streamCh: make(chan net.Conn),
 		logger:   config.Logger,
 	}
+
+	t.registerMetrics(reg)
 
 	// Clean up listeners if there's an error.
 	defer func() {
@@ -118,6 +122,15 @@ func NewTLSTransport(config *TLSTransportConfig, reg prometheus.Registerer) (*TL
 
 	ok = true
 	return &t, nil
+}
+
+func (t *TLSTransport) registerMetrics(reg prometheus.Registerer) {
+	t.connEstablished = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "memberlist_tls_transport_conn_established",
+		Help: "Amount of connections established.",
+	})
+
+	reg.MustRegister(t.connEstablished)
 }
 
 // GetAutoBindPort returns the bind port that was automatically given by the
@@ -182,8 +195,6 @@ func (t *TLSTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 		ok   bool
 	)
 
-	t.logger.Printf("Sending msg to %v", addr)
-
 	conn, ok = t.connPool.Get(addr)
 
 	if !ok {
@@ -200,6 +211,9 @@ func (t *TLSTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 		// TODO: This might only be the private, not the public address. We should
 		// probably send the advertise address down the wire.
 		conn.Write(append([]byte(t.tcpListeners[0].Addr().String()), '\n'))
+
+		incoming := false
+		t.connPool.AddAndRead(addr, conn, incoming)
 	}
 
 	// TODO: This is probably not performing very well. How about prefixing each msg
@@ -214,10 +228,6 @@ func (t *TLSTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 	if err != nil {
 		t.logger.Println(err)
 		return time.Time{}, err
-	}
-
-	if !ok {
-		t.connPool.AddAndRead(addr, conn)
 	}
 
 	return time.Now(), nil
@@ -289,6 +299,8 @@ func (t *TLSTransport) dial(addr string) (net.Conn, error) {
 		return nil, err
 	}
 
+	t.connEstablished.Inc()
+
 	return conn, nil
 }
 
@@ -323,7 +335,8 @@ func (t *TLSTransport) tcpListen(ln net.Listener) {
 
 			remoteAddr = strings.Trim(remoteAddr, "\n")
 
-			if err := t.connPool.AddAndRead(remoteAddr, conn); err != nil {
+			incoming := true
+			if err := t.connPool.AddAndRead(remoteAddr, conn, incoming); err != nil {
 				t.logger.Fatalf("failed to add connection to pool: %v", err)
 			}
 		} else {
