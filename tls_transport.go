@@ -1,6 +1,6 @@
 // Fork of https://github.com/hashicorp/memberlist/blob/master/net_transport.go
 
-package main
+package memberlisttlstransport
 
 import (
 	"bufio"
